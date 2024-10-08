@@ -8,36 +8,36 @@ LN_2 = 0.69314718056  # ln(2)
 
 @dataclass
 class SamplerConfig:
-    temp: float = 0.7
-    top_p: float = 0.9
-    top_k: int = 40
-    min_p: float = 0.05
-    low_ent_thresh: float = 0.5
-    low_vent_thresh: float = 0.5
-    med_ent_thresh: float = 2.0
-    high_ent_thresh: float = 4.0
-    high_vent_thresh: float = 4.0
+    temp: float = 0.666
+    top_p: float = 0.90
+    top_k: int = 27
+    min_p: float = 0.03
+    low_ent_thresh: float = 0.1
+    low_vent_thresh: float = 0.1
+    med_ent_thresh: float = 3.0
+    high_ent_thresh: float = 5.0
+    high_vent_thresh: float = 5.0
     n_adaptive_samples: int = 5
-    helv_attn_ent_offset: float = 1.2
-    helv_attn_ent_coef: float = 0.1
-    lehv_interaction_strength_offset: float = 1.1
-    lehv_interaction_strength_coef: float = 0.2
-    hehv_attn_ent_coef: float = 0.1
-    hehv_attn_vent_offset: float = 1.5
-    hehv_attn_vent_coef: float = 0.3
-    ada_temp_logits: float = 0.2
-    ada_temp_attn: float = 0.1
-    ada_temp_agree: float = 0.1
-    ada_top_p: float = 0.05
-    ada_top_k_int: float = 0.2
-    ada_top_k_agree: float = 0.1
-    ada_min_p: float = 0.3
-    ada_score_logits_ent: float = 0.2
-    ada_score_attn_ent: float = 0.3
-    ada_score_logits_vent: float = 0.2
-    ada_score_attn_vent: float = 0.3
-    ada_score_agree: float = 0.4
-    ada_score_int: float = 0.5
+    helv_attn_ent_offset: float = 1.3
+    helv_attn_ent_coef: float = 0.2
+    lehv_interaction_strength_offset: float = 1.2
+    lehv_interaction_strength_coef: float = 0.3
+    hehv_attn_ent_coef: float = 0.2
+    hehv_attn_vent_offset: float = 2.0
+    hehv_attn_vent_coef: float = 0.5
+    ada_temp_logits: float = 0.3
+    ada_temp_attn: float = 0.2
+    ada_temp_agree: float = 0.2
+    ada_top_p: float = 0.1
+    ada_top_k_int: float = 0.3
+    ada_top_k_agree: float = 0.2
+    ada_min_p: float = 0.5
+    ada_score_logits_ent: float = 0.1
+    ada_score_attn_ent: float = 0.2
+    ada_score_logits_vent: float = 0.3
+    ada_score_attn_vent: float = 0.4
+    ada_score_agree: float = 0.5
+    ada_score_int: float = 0.6
 
 class HookBasedEntropySampler(LogitsProcessor):
     def __init__(
@@ -96,56 +96,37 @@ class HookBasedEntropySampler(LogitsProcessor):
             "interaction_strength": interaction_strength
         }
 
-    def _sample(
+    def adjust_scores(
             self,
-            logits: torch.Tensor,
+            scores: torch.FloatTensor,
             temperature: float,
             top_p: float,
             top_k: int,
             min_p: float
-    ) -> torch.Tensor:
-        logits = logits / temperature
-        logits = torch.nan_to_num(logits, nan=0.0, posinf=100.0, neginf=-100.0)
+    ) -> torch.FloatTensor:
+        scores = scores / temperature
+        scores = torch.nan_to_num(scores, nan=float('-inf'), posinf=100.0, neginf=-100.0)
 
-        sorted_logits, sorted_indices = torch.sort(logits, descending=True)
-        cumulative_probs = F.softmax(sorted_logits, dim=-1).cumsum(dim=-1)
+        # Top-k filtering
+        top_k = min(top_k, scores.size(-1))
+        top_k_scores, _ = torch.topk(scores, top_k)
+        scores[scores < top_k_scores[..., -1, None]] = float('-inf')
 
+        # Top-p filtering
+        sorted_scores, sorted_indices = torch.sort(scores, descending=True)
+        cumulative_probs = torch.cumsum(F.softmax(sorted_scores, dim=-1), dim=-1)
         sorted_indices_to_remove = cumulative_probs > top_p
         sorted_indices_to_remove[..., :top_k] = False
+        indices_to_remove = sorted_indices_to_remove.scatter(dim=-1, index=sorted_indices, src=sorted_indices_to_remove)
+        scores[indices_to_remove] = float('-inf')
 
-        sorted_logits[sorted_indices_to_remove] = float('-inf')
-        sorted_probs = F.softmax(sorted_logits, dim=-1)
-        min_p_mask = sorted_probs < min_p
-        sorted_logits[min_p_mask] = float('-inf')
+        # Min-p filtering
+        probs = F.softmax(scores, dim=-1)
+        scores[probs < min_p] = float('-inf')
 
-        if (sorted_logits == float('-inf')).all():
-            sorted_logits = torch.zeros_like(sorted_logits)
-            sorted_logits[..., 0] = 1.0
+        return scores
 
-        probs = F.softmax(sorted_logits, dim=-1)
-        probs = torch.nan_to_num(probs, nan=0.0, posinf=0.0, neginf=0.0)
-
-        if not torch.allclose(probs.sum(), torch.tensor(1.0)):
-            probs = probs / probs.sum(dim=-1, keepdim=True)
-
-        next_token = torch.multinomial(probs, num_samples=1)
-        next_token = torch.gather(sorted_indices, -1, next_token)
-        return next_token
-
-    def _score_sample(self, sample: torch.Tensor, logits: torch.Tensor, metrics: Dict[str, torch.Tensor]) -> torch.Tensor:
-        cfg = self.config
-        log_prob = torch.sum(F.log_softmax(logits, dim=-1) * F.one_hot(sample, logits.shape[-1]))
-        confidence_score = (
-                (1 - metrics["logits_entropy"]) * cfg.ada_score_logits_ent +
-                (1 - metrics["attn_entropy"]) * cfg.ada_score_attn_ent +
-                (1 - metrics["logits_varentropy"]) * cfg.ada_score_logits_vent +
-                (1 - metrics["attn_varentropy"]) * cfg.ada_score_attn_vent +
-                metrics["agreement"] * cfg.ada_score_agree +
-                metrics["interaction_strength"] * cfg.ada_score_int
-        )
-        return log_prob + confidence_score
-
-    def adaptive_sample(self, logits: torch.Tensor, metrics: Dict[str, torch.Tensor]) -> torch.Tensor:
+    def adaptive_sample(self, scores: torch.FloatTensor, metrics: Dict[str, torch.Tensor]) -> torch.FloatTensor:
         cfg = self.config
         logits_uncertainty = metrics["logits_entropy"] + metrics["logits_varentropy"]
         attn_uncertainty = metrics["attn_entropy"] + metrics["attn_varentropy"]
@@ -165,19 +146,12 @@ class HookBasedEntropySampler(LogitsProcessor):
         ).item())
         min_p = torch.clamp(cfg.min_p * (1 - cfg.ada_min_p * logits_uncertainty), 0.01, 0.5)
 
-        samples = []
-        for _ in range(cfg.n_adaptive_samples):
-            sample = self._sample(logits, temperature=temperature, top_p=top_p, top_k=top_k, min_p=min_p)
-            samples.append(sample)
-
-        sample_scores = torch.stack([self._score_sample(sample, logits, metrics) for sample in samples])
-        best_sample_idx = torch.argmax(sample_scores)
-
-        return samples[best_sample_idx]
+        return self.adjust_scores(scores, temperature.item(), top_p.item(), top_k, min_p.item())
 
     def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
         if self.last_attention_scores is None:
-            raise ValueError("No attention scores available. Make sure the model forward pass has been called.")
+            print("Warning: No attention scores available. Using default sampling.")
+            return scores
 
         metrics = self.calculate_metrics(scores, self.last_attention_scores)
         ent, vent = metrics["logits_entropy"], metrics["logits_varentropy"]
@@ -189,19 +163,19 @@ class HookBasedEntropySampler(LogitsProcessor):
         # Low Entropy, Low Varentropy: "flowing with unspoken intent"
         if ent < cfg.low_ent_thresh and vent < cfg.low_vent_thresh:
             print("Low entropy and varentropy: using top-k sampling")
-            return self._sample(scores, temperature=cfg.temp, top_p=1.0, top_k=5, min_p=0.0)
+            return self.adjust_scores(scores, cfg.temp, 1.0, 5, 0.0)
 
         # High Entropy, Low Varentropy: "treading carefully, asking clarifying questions"
         elif ent > cfg.high_ent_thresh and vent < cfg.low_vent_thresh:
             print("High entropy, low varentropy")
             if not torch.isin(input_ids[:, -1], torch.tensor([self.clarifying_question_token_id])).any():
                 print("Inserting clarifying question token")
-                return torch.full_like(input_ids[:, -1:], self.clarifying_question_token_id)
+                scores.fill_(float('-inf'))
+                scores[:, self.clarifying_question_token_id] = 0
             else:
                 temp_adj = cfg.helv_attn_ent_offset + cfg.helv_attn_ent_coef * metrics["attn_entropy"]
                 print(f"Adjusted temperature: {temp_adj:.4f}")
-                return self._sample(scores, temperature=min(1.5, cfg.temp * temp_adj),
-                                    top_p=cfg.top_p, top_k=cfg.top_k, min_p=cfg.min_p)
+                return self.adjust_scores(scores, min(1.5, cfg.temp * temp_adj.item()), cfg.top_p, cfg.top_k, cfg.min_p)
 
         # Low Entropy, High Varentropy: "exploring forks in the path"
         elif ent < cfg.high_ent_thresh and vent > cfg.high_vent_thresh:
@@ -209,17 +183,15 @@ class HookBasedEntropySampler(LogitsProcessor):
             temp_adj = cfg.lehv_interaction_strength_offset + cfg.lehv_interaction_strength_coef * metrics["interaction_strength"]
             top_k_adj = max(5, int(cfg.top_k * (1 + 0.5 * (1 - metrics["agreement"]))))
             print(f"Adjusted temperature: {temp_adj:.4f}, Adjusted top_k: {top_k_adj}")
-            return self._sample(scores, temperature=min(1.5, cfg.temp * temp_adj),
-                                top_p=cfg.top_p, top_k=top_k_adj, min_p=cfg.min_p)
+            return self.adjust_scores(scores, min(1.5, cfg.temp * temp_adj.item()), cfg.top_p, top_k_adj, cfg.min_p)
 
         # High Entropy, High Varentropy: "resampling in the mist"
         elif ent > cfg.med_ent_thresh and vent > cfg.high_vent_thresh:
             print("High entropy and varentropy")
             temp_adj = cfg.hehv_attn_vent_offset + cfg.hehv_attn_vent_coef * metrics["attn_varentropy"]
-            top_p_adj = max(0.5, cfg.top_p - cfg.hehv_attn_ent_coef * metrics["attn_entropy"])
+            top_p_adj = max(0.5, cfg.top_p - cfg.hehv_attn_ent_coef * metrics["attn_entropy"].item())
             print(f"Adjusted temperature: {temp_adj:.4f}, Adjusted top_p: {top_p_adj:.4f}")
-            return self._sample(scores, temperature=max(1.5, cfg.temp * temp_adj),
-                                top_p=top_p_adj, top_k=cfg.top_k, min_p=cfg.min_p)
+            return self.adjust_scores(scores, max(1.5, cfg.temp * temp_adj.item()), top_p_adj, cfg.top_k, cfg.min_p)
 
         # Middle ground: use adaptive sampling
         else:
@@ -230,9 +202,8 @@ class HookBasedEntropySampler(LogitsProcessor):
 # Example usage
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
-tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-1B-Instruct")
-model = AutoModelForCausalLM.from_pretrained("meta-llama/Llama-3.2-1B-Instruct")
-
+tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-3B-Instruct")
+model = AutoModelForCausalLM.from_pretrained("meta-llama/Llama-3.2-3B-Instruct")
 
 # Assuming "..." is our pause token and "?" is our clarifying question token
 pause_token_id = tokenizer.convert_tokens_to_ids("...")
@@ -241,7 +212,7 @@ clarifying_question_token_id = tokenizer.convert_tokens_to_ids("?")
 entropy_sampler = HookBasedEntropySampler(model, tokenizer, pause_token_id, clarifying_question_token_id)
 messages = [
     {"role": "system", "content": "You are a helpful assistant."},
-    {"role": "user", "content": "Explain the concept of entropy in thermodynamics."},
+    {"role": "user", "content": "What number is bigger 9.11 or 9.9?"},
 ]
 # Tokenize the chat and create attention mask
 tokenized_chat = tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=True, return_tensors="pt")
@@ -249,10 +220,10 @@ attention_mask = tokenized_chat.ne(tokenizer.eos_token_id).long()
 
 # Set up the generation configuration
 generation_config = GenerationConfig(
-    max_new_tokens=200,
+    max_new_tokens=500,
     do_sample=True,
-    temperature=0.3,
-    top_p=1.0,
+    temperature=0.45,
+    top_p=0.95,
     num_return_sequences=1,
     no_repeat_ngram_size=3,
     pad_token_id=tokenizer.eos_token_id,  # Explicitly set pad_token_id

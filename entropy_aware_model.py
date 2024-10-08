@@ -295,7 +295,7 @@ if __name__ == "__main__":
     # Load model and tokenizer
     model_name = "meta-llama/Llama-3.2-3B-Instruct"  # Replace with your model name
     tokenizer = AutoTokenizer.from_pretrained(model_name)
-    base_model = AutoModelForCausalLM.from_pretrained(model_name, device_map="auto", torch_dtype=torch.float16)
+    base_model = AutoModelForCausalLM.from_pretrained(model_name,attn_implementation="eager", device_map="auto", torch_dtype=torch.float16)
 
     # Initialize EntropyAwareModel
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

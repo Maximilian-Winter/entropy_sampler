@@ -87,7 +87,10 @@ class HookBasedEntropySampler(LogitsProcessor):
 
         attention_probs = F.softmax(attention_scores, dim=-1)
         attn_entropy = -torch.sum(attention_probs * torch.log2(torch.clamp(attention_probs, 1e-10, 1.0)), dim=-1)
-        attn_varentropy = torch.var(attn_entropy, dim=-1)
+
+        # Fix for variance calculation
+        attn_varentropy = torch.var(attn_entropy, dim=-1, unbiased=False)
+
         mean_attention = torch.mean(attention_probs, dim=-2)
         agreement = torch.mean(torch.abs(attention_probs - mean_attention.unsqueeze(-2)), dim=(-2, -1))
         interaction_strength = torch.mean(torch.abs(attention_scores))
@@ -188,35 +191,48 @@ class HookBasedEntropySampler(LogitsProcessor):
         ent, vent = metrics["logits_entropy"], metrics["logits_varentropy"]
         cfg = self.config
 
+        # Add debugging output
+        print(f"Entropy: {ent.item():.4f}, Varentropy: {vent.item():.4f}")
+        print(f"Attention Entropy: {metrics['attn_entropy'].item():.4f}, Attention Varentropy: {metrics['attn_varentropy'].item():.4f}")
+
         # Low Entropy, Low Varentropy: "flowing with unspoken intent"
         if ent < cfg.low_ent_thresh and vent < cfg.low_vent_thresh:
+            print("Low entropy and varentropy: using argmax")
             return torch.argmax(scores, dim=-1, keepdim=True)
 
         # High Entropy, Low Varentropy: "treading carefully, asking clarifying questions"
         elif ent > cfg.high_ent_thresh and vent < cfg.low_vent_thresh:
+            print("High entropy, low varentropy")
             if not torch.isin(input_ids[:, -1], torch.tensor([self.clarifying_question_token_id])).any():
+                print("Inserting clarifying question token")
                 return torch.full_like(input_ids[:, -1:], self.clarifying_question_token_id)
             else:
                 temp_adj = cfg.helv_attn_ent_offset + cfg.helv_attn_ent_coef * metrics["attn_entropy"]
+                print(f"Adjusted temperature: {temp_adj:.4f}")
                 return self._sample(scores, temperature=min(1.5, cfg.temp * temp_adj),
                                     top_p=cfg.top_p, top_k=cfg.top_k, min_p=cfg.min_p)
 
         # Low Entropy, High Varentropy: "exploring forks in the path"
         elif ent < cfg.high_ent_thresh and vent > cfg.high_vent_thresh:
+            print("Low entropy, high varentropy")
             temp_adj = cfg.lehv_interaction_strength_offset + cfg.lehv_interaction_strength_coef * metrics["interaction_strength"]
             top_k_adj = max(5, int(cfg.top_k * (1 + 0.5 * (1 - metrics["agreement"]))))
+            print(f"Adjusted temperature: {temp_adj:.4f}, Adjusted top_k: {top_k_adj}")
             return self._sample(scores, temperature=min(1.5, cfg.temp * temp_adj),
                                 top_p=cfg.top_p, top_k=top_k_adj, min_p=cfg.min_p)
 
         # High Entropy, High Varentropy: "resampling in the mist"
         elif ent > cfg.med_ent_thresh and vent > cfg.high_vent_thresh:
+            print("High entropy and varentropy")
             temp_adj = cfg.hehv_attn_vent_offset + cfg.hehv_attn_vent_coef * metrics["attn_varentropy"]
             top_p_adj = max(0.5, cfg.top_p - cfg.hehv_attn_ent_coef * metrics["attn_entropy"])
+            print(f"Adjusted temperature: {temp_adj:.4f}, Adjusted top_p: {top_p_adj:.4f}")
             return self._sample(scores, temperature=max(2.0, cfg.temp * temp_adj),
                                 top_p=top_p_adj, top_k=cfg.top_k, min_p=cfg.min_p)
 
         # Middle ground: use adaptive sampling
         else:
+            print("Using adaptive sampling")
             return self.adaptive_sample(scores, metrics)
 
 

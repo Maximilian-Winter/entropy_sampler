@@ -4,6 +4,7 @@ This repository contains an implementation of an entropy-based sampler for langu
 
 I used Claude Sonnet 3.5 to help me with the code and the math behind it.
 
+Currently should work with llama 3.2 models. Can be adopted for other models realtivly easy, I think, by adopting the attention map hooks.
 
 ## Key Concepts
 

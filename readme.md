@@ -1,6 +1,6 @@
 # Entropy-based Sampler for Language Models
 
-This repository contains an implementation of an entropy-based sampler for language models, inspired by the entropix project. The sampler uses entropy and varentropy metrics to dynamically adjust sampling parameters during text generation, potentially leading to more coherent and context-aware outputs.
+This repository contains an implementation of an entropy-based sampler for language models, inspired by the entropix project. It is implemented as a logits processor for Hugginface and the PyTorch Library. The sampler uses entropy and varentropy metrics to dynamically adjust sampling parameters during text generation, potentially leading to more coherent and context-aware outputs.
 
 I used Claude Sonnet 3.5 to help me with the code and the math behind it.
 
@@ -24,10 +24,6 @@ git clone https://github.com/yourusername/entropy-sampler.git
 cd entropy-sampler
 ```
 
-2. Install the required dependencies:
-```
-pip install torch transformers
-```
 
 ## Usage
 

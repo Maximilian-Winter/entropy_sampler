@@ -42,33 +42,32 @@ class SamplerConfig:
 
 class EntropyAwareModel(nn.Module):
     def __init__(self, base_model: PreTrainedModel, tokenizer: PreTrainedTokenizer,
-                 config: Optional[SamplerConfig] = None):
+                 config: Optional[SamplerConfig] = None, device: Optional[torch.device] = None):
         super().__init__()
         self.base_model = base_model
         self.tokenizer = tokenizer
         self.config = config or SamplerConfig()
         self.entropy_history = []
         self.varentropy_history = []
+        self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.base_model.to(self.device)
+        self.to(self.device)
+        print(f"Using device: {self.device}")
 
     def forward(self, *args, **kwargs):
         return self.base_model(*args, **kwargs)
 
-    def calculate_varentropy_logsoftmax(self, logits: torch.Tensor, axis: int = -1) -> Tuple[
-        torch.Tensor, torch.Tensor]:
+    def calculate_varentropy_logsoftmax(self, logits: torch.Tensor, axis: int = -1) -> Tuple[torch.Tensor, torch.Tensor]:
         log_probs = F.log_softmax(logits, dim=axis)
         probs = torch.exp(log_probs)
-        entropy = -torch.sum(probs * log_probs, dim=axis) / torch.log(torch.tensor(2.0))  # Convert to base-2
-        varentropy = torch.sum(probs * (log_probs / torch.log(torch.tensor(2.0)) + entropy.unsqueeze(-1)) ** 2,
-                               dim=axis)
+        entropy = -torch.sum(probs * log_probs, dim=axis) / torch.log(torch.tensor(2.0, device=self.device))
+        varentropy = torch.sum(probs * (log_probs / torch.log(torch.tensor(2.0, device=self.device)) + entropy.unsqueeze(-1)) ** 2, dim=axis)
         return entropy, varentropy
 
     def calculate_metrics(self, logits: torch.Tensor, attention_scores: List[torch.Tensor]) -> Dict[str, torch.Tensor]:
         entropy, varentropy = self.calculate_varentropy_logsoftmax(logits)
 
-        # Aggregate attention scores across all layers
         attn_scores = torch.stack(attention_scores, dim=0).mean(dim=0)
-
-        # Focus on the current token being generated
         current_token_attn = attn_scores[:, :, -1, :]
 
         attention_probs = F.softmax(current_token_attn, dim=-1)
@@ -94,12 +93,10 @@ class EntropyAwareModel(nn.Module):
         scores = scores / temperature
         scores = torch.nan_to_num(scores, nan=float('-inf'), posinf=100.0, neginf=-100.0)
 
-        # Top-k filtering
         top_k = min(top_k, scores.size(-1))
         top_k_scores, _ = torch.topk(scores, top_k)
         scores[scores < top_k_scores[..., -1, None]] = float('-inf')
 
-        # Top-p filtering
         sorted_scores, sorted_indices = torch.sort(scores, descending=True)
         cumulative_probs = torch.cumsum(F.softmax(sorted_scores, dim=-1), dim=-1)
         sorted_indices_to_remove = cumulative_probs > top_p
@@ -107,7 +104,6 @@ class EntropyAwareModel(nn.Module):
         indices_to_remove = sorted_indices_to_remove.scatter(dim=-1, index=sorted_indices, src=sorted_indices_to_remove)
         scores[indices_to_remove] = float('-inf')
 
-        # Min-p filtering
         probs = F.softmax(scores, dim=-1)
         scores[probs < min_p] = float('-inf')
 
@@ -197,8 +193,12 @@ class EntropyAwareModel(nn.Module):
             print("Using adaptive sampling")
             return self.adaptive_sample(scores, metrics)
 
+    @torch.no_grad()
     def generate(self, input_ids: torch.LongTensor, attention_mask: Optional[torch.LongTensor] = None, **kwargs):
         max_length = kwargs.get('max_length', self.base_model.config.max_length)
+        input_ids = input_ids.to(self.device)
+        if attention_mask is not None:
+            attention_mask = attention_mask.to(self.device)
 
         for _ in range(max_length - input_ids.shape[1]):
             outputs = self.base_model(input_ids, attention_mask=attention_mask, output_attentions=True)
@@ -220,7 +220,6 @@ class EntropyAwareModel(nn.Module):
 
         return input_ids
 
-
 # Example usage
 if __name__ == "__main__":
     from transformers import AutoTokenizer, AutoModelForCausalLM
@@ -231,7 +230,8 @@ if __name__ == "__main__":
     base_model = AutoModelForCausalLM.from_pretrained(model_name, attn_implementation="eager")
 
     # Initialize EntropyAwareModel
-    entropy_model = EntropyAwareModel(base_model, tokenizer)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    entropy_model = EntropyAwareModel(base_model, tokenizer, device=device)
 
     messages = [
         {"role": "system", "content": "You are a helpful assistant."},

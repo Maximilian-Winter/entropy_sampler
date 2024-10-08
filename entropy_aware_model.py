@@ -4,6 +4,11 @@ import torch.nn.functional as F
 from transformers import PreTrainedModel, PreTrainedTokenizer
 from typing import List, Tuple, Dict, Optional
 from dataclasses import dataclass
+import logging
+import math
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -40,6 +45,37 @@ class SamplerConfig:
     ada_score_int: float = 0.6
 
 
+class KVCache:
+    def __init__(self, max_seq_len: int, num_layers: int, num_heads: int, head_dim: int, device: torch.device):
+        self.cache = None
+        self.current_seq_len = None
+        self.max_seq_len = max_seq_len
+        self.num_layers = num_layers
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        self.device = device
+        self.clear()
+
+    def clear(self):
+        self.cache = {"k": [], "v": []}
+        for _ in range(self.num_layers):
+            self.cache["k"].append(None)
+            self.cache["v"].append(None)
+        self.current_seq_len = 0
+
+    def update(self, key: torch.Tensor, value: torch.Tensor, layer: int, position: int):
+        if self.cache["k"][layer] is None:
+            self.cache["k"][layer] = key
+            self.cache["v"][layer] = value
+        else:
+            self.cache["k"][layer] = torch.cat([self.cache["k"][layer], key], dim=-2)
+            self.cache["v"][layer] = torch.cat([self.cache["v"][layer], value], dim=-2)
+        self.current_seq_len = max(self.current_seq_len, position + 1)
+
+    def get(self, layer: int):
+        return self.cache["k"][layer], self.cache["v"][layer]
+
+
 class EntropyAwareModel(nn.Module):
     def __init__(self, base_model: PreTrainedModel, tokenizer: PreTrainedTokenizer,
                  config: Optional[SamplerConfig] = None, device: Optional[torch.device] = None):
@@ -47,45 +83,72 @@ class EntropyAwareModel(nn.Module):
         self.base_model = base_model
         self.tokenizer = tokenizer
         self.config = config or SamplerConfig()
-        self.entropy_history = []
-        self.varentropy_history = []
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.base_model.to(self.device)
         self.to(self.device)
-        print(f"Using device: {self.device}")
+
+        # Initialize KV-Cache
+        self.kv_cache = KVCache(
+            max_seq_len=16372,
+            num_layers=self.base_model.config.num_hidden_layers,
+            num_heads=self.base_model.config.num_attention_heads,
+            head_dim=self.base_model.config.hidden_size // self.base_model.config.num_attention_heads,
+            device=self.device
+        )
+
+        # Initialize EMA for entropy and varentropy
+        self.ema_entropy = 0
+        self.ema_varentropy = 0
+        self.ema_alpha = 0.1  # Adjust this value to control the EMA update rate
+
+        logger.info(f"Initialized EntropyAwareModel using device: {self.device}")
 
     def forward(self, *args, **kwargs):
         return self.base_model(*args, **kwargs)
 
-    def calculate_varentropy_logsoftmax(self, logits: torch.Tensor, axis: int = -1) -> Tuple[torch.Tensor, torch.Tensor]:
+    def calculate_varentropy_logsoftmax(self, logits: torch.Tensor, axis: int = -1) -> Tuple[
+        torch.Tensor, torch.Tensor]:
         log_probs = F.log_softmax(logits, dim=axis)
         probs = torch.exp(log_probs)
-        entropy = -torch.sum(probs * log_probs, dim=axis) / torch.log(torch.tensor(2.0, device=self.device))
-        varentropy = torch.sum(probs * (log_probs / torch.log(torch.tensor(2.0, device=self.device)) + entropy.unsqueeze(-1)) ** 2, dim=axis)
+        entropy = -torch.sum(probs * log_probs, dim=axis) / math.log(2)
+        varentropy = torch.sum(probs * (log_probs / math.log(2) + entropy.unsqueeze(-1)) ** 2, dim=axis)
         return entropy, varentropy
 
     def calculate_metrics(self, logits: torch.Tensor, attention_scores: List[torch.Tensor]) -> Dict[str, torch.Tensor]:
         entropy, varentropy = self.calculate_varentropy_logsoftmax(logits)
 
-        attn_scores = torch.stack(attention_scores, dim=0).mean(dim=0)
-        current_token_attn = attn_scores[:, :, -1, :]
+        # Process attention scores
+        attn_scores = torch.stack(attention_scores, dim=0)
+        current_token_attn = attn_scores[:, :, :, -1, :]  # [num_layers, batch_size, num_heads, seq_len]
 
         attention_probs = F.softmax(current_token_attn, dim=-1)
         attn_entropy = -torch.sum(attention_probs * torch.log2(torch.clamp(attention_probs, 1e-10, 1.0)), dim=-1)
         attn_varentropy = torch.var(attn_entropy, dim=-1, unbiased=False)
 
-        mean_attention = torch.mean(attention_probs, dim=-2)
-        agreement = torch.mean(torch.abs(attention_probs - mean_attention.unsqueeze(-2)), dim=(-2, -1))
+        # Calculate layer-wise metrics
+        layer_metrics = []
+        for layer in range(attn_scores.size(0)):
+            layer_attn = attention_probs[layer]
+            layer_mean_attention = torch.mean(layer_attn, dim=1)
+            layer_agreement = torch.mean(torch.abs(layer_attn - layer_mean_attention.unsqueeze(1)), dim=(1, 2))
+            layer_interaction_strength = torch.mean(torch.abs(current_token_attn[layer]))
+            layer_metrics.append({
+                "agreement": layer_agreement,
+                "interaction_strength": layer_interaction_strength
+            })
 
-        interaction_strength = torch.mean(torch.abs(current_token_attn))
+        # Aggregate metrics across layers
+        agreement = torch.mean(torch.stack([lm["agreement"] for lm in layer_metrics]))
+        interaction_strength = torch.mean(torch.stack([lm["interaction_strength"] for lm in layer_metrics]))
 
         return {
             "logits_entropy": torch.mean(entropy),
             "logits_varentropy": torch.mean(varentropy),
             "attn_entropy": torch.mean(attn_entropy),
             "attn_varentropy": torch.mean(attn_varentropy),
-            "agreement": torch.mean(agreement),
-            "interaction_strength": interaction_strength
+            "agreement": agreement,
+            "interaction_strength": interaction_strength,
+            "layer_metrics": layer_metrics
         }
 
     def adjust_scores(self, scores: torch.FloatTensor, temperature: float, top_p: float, top_k: int,
@@ -128,97 +191,102 @@ class EntropyAwareModel(nn.Module):
 
         return self.adjust_scores(scores, temperature.item(), top_p.item(), top_k, min_p.item())
 
+    def update_ema(self, entropy: float, varentropy: float):
+        self.ema_entropy = self.ema_alpha * entropy + (1 - self.ema_alpha) * self.ema_entropy
+        self.ema_varentropy = self.ema_alpha * varentropy + (1 - self.ema_alpha) * self.ema_varentropy
+
     def entropy_based_sampling(self, input_ids: torch.LongTensor, scores: torch.FloatTensor,
                                metrics: Dict[str, torch.Tensor]) -> torch.FloatTensor:
         ent, vent = metrics["logits_entropy"], metrics["logits_varentropy"]
         cfg = self.config
 
-        self.entropy_history.append(ent.item())
-        self.varentropy_history.append(vent.item())
+        self.update_ema(ent.item(), vent.item())
 
-        if len(self.entropy_history) > 100:  # Adjust window size as needed
-            self.entropy_history.pop(0)
-            self.varentropy_history.pop(0)
+        # Dynamically adjust thresholds based on EMA
+        low_ent_thresh = self.ema_entropy * 0.5
+        high_ent_thresh = self.ema_entropy * 1.5
+        low_vent_thresh = self.ema_varentropy * 0.5
+        high_vent_thresh = self.ema_varentropy * 1.5
 
-        avg_ent = sum(self.entropy_history) / len(self.entropy_history)
-        avg_vent = sum(self.varentropy_history) / len(self.varentropy_history)
-
-        # Dynamically adjust thresholds
-        low_ent_thresh = avg_ent * 0.5
-        high_ent_thresh = avg_ent * 1.5
-        low_vent_thresh = avg_vent * 0.5
-        high_vent_thresh = avg_vent * 1.5
-
-        print(f"Entropy: {ent.item():.4f}, Varentropy: {vent.item():.4f}")
-        print(
+        logger.info(f"Entropy: {ent.item():.4f}, Varentropy: {vent.item():.4f}")
+        logger.info(f"EMA Entropy: {self.ema_entropy:.4f}, EMA Varentropy: {self.ema_varentropy:.4f}")
+        logger.info(
             f"Attention Entropy: {metrics['attn_entropy'].item():.4f}, Attention Varentropy: {metrics['attn_varentropy'].item():.4f}")
 
-        # Low Entropy, Low Varentropy: "flowing with unspoken intent"
+        # Sampling logic
         if ent < low_ent_thresh and vent < low_vent_thresh:
-            print("Low entropy and varentropy: using top-k sampling")
+            logger.info("Low entropy and varentropy: using top-k sampling")
             return self.adjust_scores(scores, cfg.temp, 1.0, 5, 0.0)
-
-        # High Entropy, Low Varentropy: "treading carefully, asking clarifying questions"
         elif ent > high_ent_thresh and vent < low_vent_thresh:
-            print("High entropy, low varentropy")
+            logger.info("High entropy, low varentropy")
             clarifying_question_token_id = self.tokenizer.convert_tokens_to_ids("?")
-            if not torch.isin(input_ids[:, -1], torch.tensor([clarifying_question_token_id])).any():
-                print("Inserting clarifying question token")
+            if not torch.isin(input_ids[:, -1], torch.tensor([clarifying_question_token_id], device=self.device)).any():
+                logger.info("Inserting clarifying question token")
                 scores.fill_(float('-inf'))
                 scores[:, clarifying_question_token_id] = 0
             else:
                 temp_adj = cfg.helv_attn_ent_offset + cfg.helv_attn_ent_coef * metrics["attn_entropy"]
-                print(f"Adjusted temperature: {temp_adj:.4f}")
+                logger.info(f"Adjusted temperature: {temp_adj:.4f}")
                 return self.adjust_scores(scores, min(1.5, cfg.temp * temp_adj.item()), cfg.top_p, cfg.top_k, cfg.min_p)
-
-        # Low Entropy, High Varentropy: "exploring forks in the path"
         elif ent < high_ent_thresh and vent > high_vent_thresh:
-            print("Low entropy, high varentropy")
+            logger.info("Low entropy, high varentropy")
             temp_adj = cfg.lehv_interaction_strength_offset + cfg.lehv_interaction_strength_coef * metrics[
                 "interaction_strength"]
             top_k_adj = max(5, int(cfg.top_k * (1 + 0.5 * (1 - metrics["agreement"]))))
-            print(f"Adjusted temperature: {temp_adj:.4f}, Adjusted top_k: {top_k_adj}")
+            logger.info(f"Adjusted temperature: {temp_adj:.4f}, Adjusted top_k: {top_k_adj}")
             return self.adjust_scores(scores, min(1.5, cfg.temp * temp_adj.item()), cfg.top_p, top_k_adj, cfg.min_p)
-
-        # High Entropy, High Varentropy: "resampling in the mist"
         elif ent > cfg.med_ent_thresh and vent > high_vent_thresh:
-            print("High entropy and varentropy")
+            logger.info("High entropy and varentropy")
             temp_adj = cfg.hehv_attn_vent_offset + cfg.hehv_attn_vent_coef * metrics["attn_varentropy"]
             top_p_adj = max(0.5, cfg.top_p - cfg.hehv_attn_ent_coef * metrics["attn_entropy"].item())
-            print(f"Adjusted temperature: {temp_adj:.4f}, Adjusted top_p: {top_p_adj:.4f}")
+            logger.info(f"Adjusted temperature: {temp_adj:.4f}, Adjusted top_p: {top_p_adj:.4f}")
             return self.adjust_scores(scores, max(1.5, cfg.temp * temp_adj.item()), top_p_adj, cfg.top_k, cfg.min_p)
-
-        # Middle ground: use adaptive sampling
         else:
-            print("Using adaptive sampling")
+            logger.info("Using adaptive sampling")
             return self.adaptive_sample(scores, metrics)
 
     @torch.no_grad()
-    def generate(self, input_ids: torch.LongTensor, attention_mask: Optional[torch.LongTensor] = None, **kwargs):
-        max_length = kwargs.get('max_length', self.base_model.config.max_length)
+    def generate(self, input_ids: torch.LongTensor, attention_mask: Optional[torch.LongTensor] = None, max_length: int = None):
+        max_length = max_length or self.base_model.config.max_length
         input_ids = input_ids.to(self.device)
         if attention_mask is not None:
             attention_mask = attention_mask.to(self.device)
 
-        for _ in range(max_length - input_ids.shape[1]):
-            outputs = self.base_model(input_ids, attention_mask=attention_mask, output_attentions=True)
-            next_token_logits = outputs.logits[:, -1, :]
+        self.kv_cache.clear()
+
+        for i in range(input_ids.shape[1], max_length):
+            # Prepare inputs
+            if i == input_ids.shape[1]:
+                inputs = self.base_model.prepare_inputs_for_generation(input_ids, attention_mask=attention_mask)
+            else:
+                inputs = self.base_model.prepare_inputs_for_generation(input_ids[:, -1:], past_key_values=past_key_values)
+
+            # Forward pass
+            outputs = self.base_model(**inputs, output_attentions=True)
+            logits = outputs.logits[:, -1, :]
             attention_scores = outputs.attentions
+            past_key_values = outputs.past_key_values
 
-            metrics = self.calculate_metrics(next_token_logits, attention_scores)
-            adjusted_logits = self.entropy_based_sampling(input_ids, next_token_logits, metrics)
+            # Update KV-Cache
+            for layer, (key, value) in enumerate(past_key_values):
+                self.kv_cache.update(key, value, layer, i)
 
+            # Calculate metrics and sample next token
+            metrics = self.calculate_metrics(logits, attention_scores)
+            adjusted_logits = self.entropy_based_sampling(input_ids, logits, metrics)
             next_token = torch.multinomial(F.softmax(adjusted_logits, dim=-1), num_samples=1)
 
+            # Append new token to input_ids
             input_ids = torch.cat([input_ids, next_token], dim=-1)
             if attention_mask is not None:
-                attention_mask = torch.cat([attention_mask, attention_mask.new_ones((attention_mask.shape[0], 1))],
-                                           dim=-1)
+                attention_mask = torch.cat([attention_mask, attention_mask.new_ones((attention_mask.shape[0], 1))], dim=-1)
 
+            # Check for EOS token
             if next_token.item() == self.base_model.config.eos_token_id:
                 break
 
         return input_ids
+
 
 # Example usage
 if __name__ == "__main__":
@@ -227,12 +295,13 @@ if __name__ == "__main__":
     # Load model and tokenizer
     model_name = "meta-llama/Llama-3.2-3B-Instruct"  # Replace with your model name
     tokenizer = AutoTokenizer.from_pretrained(model_name)
-    base_model = AutoModelForCausalLM.from_pretrained(model_name, attn_implementation="eager")
+    base_model = AutoModelForCausalLM.from_pretrained(model_name, device_map="auto", torch_dtype=torch.float16)
 
     # Initialize EntropyAwareModel
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     entropy_model = EntropyAwareModel(base_model, tokenizer, device=device)
 
+    # Prepare input
     messages = [
         {"role": "system", "content": "You are a helpful assistant."},
         {"role": "user", "content": "What number is bigger 9.11 or 9.9?"},

@@ -1,22 +1,17 @@
 import torch
 import torch.nn.functional as F
-from transformers import PreTrainedModel, PreTrainedTokenizer
+from transformers import AutoTokenizer, AutoModelForCausalLM
+import logging
 
+# Setup logging
+logging.basicConfig(level=logging.INFO, format='%(message)s')
+logger = logging.getLogger(__name__)
 
 class EntropyBasedSampler:
-    def __init__(self, model: PreTrainedModel, tokenizer: PreTrainedTokenizer,
+    def __init__(self, model, tokenizer,
                  entropy_min=1.0, entropy_max=5.0, temp_min=0.7, temp_max=1.5, beta=0.9):
         """
         Wrapper for a language model to perform entropy-based sampling.
-
-        Args:
-            model (PreTrainedModel): The language model.
-            tokenizer (PreTrainedTokenizer): The tokenizer.
-            entropy_min (float): Minimum expected entropy.
-            entropy_max (float): Maximum expected entropy.
-            temp_min (float): Minimum temperature to use.
-            temp_max (float): Maximum temperature to use.
-            beta (float): Smoothing factor for moving average (0 < beta < 1).
         """
         self.model = model
         self.tokenizer = tokenizer
@@ -30,15 +25,6 @@ class EntropyBasedSampler:
     def generate(self, input_ids, max_length=50, pad_token_id=None, eos_token_id=None):
         """
         Generates text using entropy-based sampling.
-
-        Args:
-            input_ids (torch.LongTensor): Input prompt token IDs.
-            max_length (int): Maximum length of the generated sequence.
-            pad_token_id (int, optional): Padding token ID.
-            eos_token_id (int, optional): End-of-sequence token ID.
-
-        Returns:
-            torch.LongTensor: Generated token IDs.
         """
         generated = input_ids
         batch_size = input_ids.size(0)
@@ -51,8 +37,15 @@ class EntropyBasedSampler:
         # Initialize past_key_values for efficient decoding
         past = None
 
-        for _ in range(max_length):
-            outputs = self.model(input_ids=generated[:, -1:], past_key_values=past, return_dict=True)
+        for step in range(max_length):
+            if past is None:
+                # For the first step, pass the full input_ids
+                model_inputs = {'input_ids': generated}
+            else:
+                # For subsequent steps, pass only the last token and past_key_values
+                model_inputs = {'input_ids': next_token, 'past_key_values': past}
+
+            outputs = self.model(**model_inputs, return_dict=True, use_cache=True)
 
             # Update past_key_values
             past = outputs.past_key_values
@@ -84,12 +77,23 @@ class EntropyBasedSampler:
 
             # Sample the next token
             next_token = torch.multinomial(F.softmax(adjusted_logits, dim=-1), num_samples=1)  # Shape: (batch_size, 1)
+
             # Append to generated tokens
             generated = torch.cat((generated, next_token), dim=1)
-            print(self.tokenizer.decode(next_token.item()), end="")
+
+            # Decode the token and print
+            decoded_token = self.tokenizer.decode(next_token.squeeze())
+            print(decoded_token, end="", flush=True)
+
+            # Logging
+            logger.info(f"\nStep {step + 1}")
+            logger.info(f"Entropy: {entropy.item():.4f}")
+            logger.info(f"Temperature: {temperature.squeeze().item():.4f}")
+            logger.info(f"Generated Token: {decoded_token}")
 
             # Check for EOS token
             if (next_token == eos_token_id).all():
+                logger.info("EOS token detected, stopping generation.")
                 break
 
         return generated
@@ -101,7 +105,7 @@ from transformers import AutoTokenizer, AutoModelForCausalLM, GenerationConfig
 tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-1B-Instruct")
 model = AutoModelForCausalLM.from_pretrained("meta-llama/Llama-3.2-1B-Instruct").to("cuda")
 
-entropy_sampler_model = EntropyBasedSampler(model, tokenizer, entropy_min=0.1, entropy_max=2.5, temp_min=0.25, temp_max=1.0, beta=0.9)
+entropy_sampler_model = EntropyBasedSampler(model, tokenizer, entropy_min=0.75, entropy_max=3.0, temp_min=0.4, temp_max=0.75, beta=0.8)
 
 # Prepare input
 messages = [

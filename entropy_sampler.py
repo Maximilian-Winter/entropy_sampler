@@ -197,5 +197,3 @@ class HookBasedEntropySampler(LogitsProcessor):
         else:
             print("Using adaptive sampling")
             return self.adaptive_sample(scores, metrics)
-
-

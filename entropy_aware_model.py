@@ -252,7 +252,7 @@ if __name__ == "__main__":
     # Prepare input
     messages = [
         {"role": "system", "content": "You are a helpful assistant."},
-        {"role": "user", "content": "What number is bigger 9.11 or 9.9? Think through it step by step."},
+        {"role": "user", "content": "What number is bigger 9.11 or 9.9? Let's think through this step by step."},
     ]
     tokenized_chat = tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=True,
                                                    return_tensors="pt")

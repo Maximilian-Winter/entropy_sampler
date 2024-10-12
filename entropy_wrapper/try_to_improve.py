@@ -295,7 +295,7 @@ class BaseEntropyAnalysisWrapper(ABC):
 
                 generated_token = self.tokenizer.decode(next_token_id[0], skip_special_tokens=True)
                 print(f"Step {step + 1} - Generated Token: {generated_token}")
-                print(f"Step Analysis: {step_analysis}")
+                # print(f"Step Analysis: {step_analysis}")
                 print("-" * 50)
 
                 if next_token_id.item() == self.tokenizer.eos_token_id:
@@ -311,13 +311,14 @@ class BaseEntropyAnalysisWrapper(ABC):
         print(final_generated_text)
 
         return {
+            'generated_ids': generated_ids,
             'generated_text': final_generated_text,
             'step_analyses': generation_results
         }
 
     def analyze_step(self, logits: torch.Tensor, attentions: List[torch.Tensor],
                      hidden_states: List[torch.Tensor]) -> Dict:
-        step_analysis = {}
+        step_analysis = {"attentions": attentions, "hidden_states": hidden_states}
 
         if self.config.logits_entropy.enabled:
             probs = F.softmax(logits[:, -1, :], dim=-1)
@@ -408,6 +409,118 @@ class BaseEntropyAnalysisWrapper(ABC):
         except Exception as e:
             print(f"Error in gradient importance analysis: {e}")
 
+    def visualize_entropy_over_time(self, generation_results: Dict):
+        if not (self.config.logits_entropy.enabled and self.config.attention_entropy.enabled):
+            print("Logits and attention entropy visualization is not enabled in the configuration.")
+            return
+
+        steps = range(1, len(generation_results['step_analyses']) + 1)
+        logits_entropies = [step['logits_entropy'] for step in generation_results['step_analyses']]
+        attention_entropies = [step['attention_entropy'] for step in generation_results['step_analyses']]
+
+        plt.figure(figsize=(12, 6))
+        plt.plot(steps, logits_entropies, label='Logits Entropy', marker='o')
+        plt.plot(steps, attention_entropies, label='Attention Entropy', marker='s')
+        plt.xlabel('Generation Step')
+        plt.ylabel('Entropy')
+        plt.title('Entropy Over Time')
+        plt.legend()
+        plt.grid(True)
+        plt.show()
+
+    def visualize_hidden_state_norms(self, generation_results: Dict):
+        if not self.config.hidden_states.enabled:
+            print("Hidden state visualization is not enabled in the configuration.")
+            return
+
+        steps = range(1, len(generation_results['step_analyses']) + 1)
+        hidden_state_norms = [step['hidden_state_norm'] for step in generation_results['step_analyses']]
+
+        plt.figure(figsize=(12, 6))
+        plt.plot(steps, hidden_state_norms, marker='o')
+        plt.xlabel('Generation Step')
+        plt.ylabel('Hidden State Norm')
+        plt.title('Hidden State Norm Over Time')
+        plt.grid(True)
+        plt.show()
+
+    def visualize_model_states(self, generation_results: Dict):
+        if 'model_state' not in generation_results['step_analyses'][0]:
+            print("Model state visualization is not available.")
+            return
+
+        steps = range(1, len(generation_results['step_analyses']) + 1)
+        states = [step['model_state'] for step in generation_results['step_analyses']]
+
+        state_to_num = {'Uncertain': 0, 'Confident': 1, 'Overconfident': 2}
+        numeric_states = [state_to_num[state] for state in states]
+
+        plt.figure(figsize=(12, 6))
+        plt.plot(steps, numeric_states, marker='o')
+        plt.yticks([0, 1, 2], ['Uncertain', 'Confident', 'Overconfident'])
+        plt.xlabel('Generation Step')
+        plt.ylabel('Model State')
+        plt.title('Model State Over Time')
+        plt.grid(True)
+        plt.show()
+
+    def visualize_attention_heatmap(self, attentions: List[torch.Tensor], tokens: List[str]):
+        if not self.config.attention_entropy.enabled:
+            print("Attention visualization is not enabled in the configuration.")
+            return
+
+        last_layer_attn = attentions[-1][0]  # [num_heads, seq_len, seq_len]
+        avg_attn = last_layer_attn.mean(dim=0)  # [seq_len, seq_len]
+
+        plt.figure(figsize=(12, 10))
+        sns.heatmap(avg_attn.cpu().numpy(), xticklabels=tokens, yticklabels=tokens, cmap='viridis')
+        plt.title('Average Attention Heatmap')
+        plt.xlabel('Key Positions')
+        plt.ylabel('Query Positions')
+        plt.tight_layout()
+        plt.show()
+
+    def visualize_head_entropies(self, attentions: List[torch.Tensor]):
+        if not self.config.head_entropies.enabled:
+            print("Head entropies visualization is not enabled in the configuration.")
+            return
+
+        last_layer_attn = attentions[-1][0]  # [num_heads, seq_len, seq_len]
+        num_heads = last_layer_attn.size(0)
+        head_entropies = [self.calculate_entropy(last_layer_attn[head][-1, :].cpu().numpy()) for head in
+                          range(num_heads)]
+
+        plt.figure(figsize=(12, 6))
+        plt.bar(range(num_heads), head_entropies)
+        plt.xlabel('Attention Head')
+        plt.ylabel('Entropy')
+        plt.title('Entropy of Attention Heads')
+        plt.xticks(range(num_heads))
+        plt.grid(axis='y')
+        plt.show()
+
+    def visualize_layer_activations(self, hidden_states: List[torch.Tensor]):
+        if not self.config.layer_wise_activation.enabled:
+            print("Layer-wise activation visualization is not enabled in the configuration.")
+            return
+
+        layer_stats = self.layer_wise_activation_stats(hidden_states)
+        layers = [stat['layer'] for stat in layer_stats]
+        mean_activations = [stat['mean_activation'] for stat in layer_stats]
+        std_activations = [stat['std_activation'] for stat in layer_stats]
+        norm_activations = [stat['norm_activation'] for stat in layer_stats]
+
+        plt.figure(figsize=(12, 8))
+        plt.plot(layers, mean_activations, label='Mean Activation', marker='o')
+        plt.plot(layers, std_activations, label='Std Activation', marker='s')
+        plt.plot(layers, norm_activations, label='Norm Activation', marker='^')
+        plt.xlabel('Layer')
+        plt.ylabel('Activation')
+        plt.title('Layer-wise Activation Statistics')
+        plt.legend()
+        plt.grid(True)
+        plt.show()
+
 
 class BasicEntropyAnalysisWrapper(BaseEntropyAnalysisWrapper):
     def _load_model(self, model_name: str, device: str) -> AutoModelForCausalLM:
@@ -429,23 +542,147 @@ if __name__ == "__main__":
 
     # Collect calibration data
     input_output_pairs = [
-        ("Once upon a time", " there was a brave knight."),
-        ("The capital of France is", " Paris."),
-        ("In quantum mechanics,", " particles can be in multiple states."),
+    ("""<|start_header_id|>system<|end_header_id|>
+
+Cutting Knowledge Date: December 2023
+Today Date: 12 Oct 2024
+
+You are Claude, an AI assistant created by Anthropic to be helpful, harmless, and honest.
+<|eot_id|>
+<|start_header_id|>user<|end_header_id|>
+
+What's the capital of France?
+<|eot_id|>
+<|start_header_id|>assistant<|end_header_id|>""", """
+The capital of France is Paris.
+<|eot_id|>"""),
+
+    ("""<|start_header_id|>system<|end_header_id|>
+
+Cutting Knowledge Date: December 2023
+Today Date: 12 Oct 2024
+
+You are Claude, an AI assistant created by Anthropic to be helpful, harmless, and honest.
+<|eot_id|>
+<|start_header_id|>user<|end_header_id|>
+
+Explain the concept of photosynthesis.
+<|eot_id|>
+<|start_header_id|>assistant<|end_header_id|>""", """
+Photosynthesis is the process by which plants and other organisms convert light energy into chemical energy. It involves the following steps:
+
+1. Light absorption by chlorophyll in plant leaves
+2. Conversion of light energy to chemical energy (ATP and NADPH)
+3. Use of this energy to convert CO2 and water into glucose
+4. Release of oxygen as a byproduct
+
+This process is crucial for life on Earth as it produces oxygen and forms the base of most food chains.
+<|eot_id|>"""),
+
+    ("""<|start_header_id|>system<|end_header_id|>
+
+Cutting Knowledge Date: December 2023
+Today Date: 12 Oct 2024
+
+You are Claude, an AI assistant created by Anthropic to be helpful, harmless, and honest.
+<|eot_id|>
+<|start_header_id|>user<|end_header_id|>
+
+Write a haiku about spring.
+<|eot_id|>
+<|start_header_id|>assistant<|end_header_id|>""", """
+Here's a haiku about spring:
+
+Soft breeze whispers by
+Cherry blossoms paint the sky
+New life awakens
+<|eot_id|>"""),
+
+    ("""<|start_header_id|>system<|end_header_id|>
+
+Cutting Knowledge Date: December 2023
+Today Date: 12 Oct 2024
+
+You are Claude, an AI assistant created by Anthropic to be helpful, harmless, and honest.
+<|eot_id|>
+<|start_header_id|>user<|end_header_id|>
+
+What are the three states of matter?
+<|eot_id|>
+<|start_header_id|>assistant<|end_header_id|>""", """
+The three main states of matter are:
+
+1. Solid
+2. Liquid
+3. Gas
+
+Each state has distinct properties based on the arrangement and movement of particles within the substance.
+<|eot_id|>"""),
+
+    ("""<|start_header_id|>system<|end_header_id|>
+
+Cutting Knowledge Date: December 2023
+Today Date: 12 Oct 2024
+
+You are Claude, an AI assistant created by Anthropic to be helpful, harmless, and honest.
+<|eot_id|>
+<|start_header_id|>user<|end_header_id|>
+
+How does a rainbow form?
+<|eot_id|>
+<|start_header_id|>assistant<|end_header_id|>""", """
+A rainbow forms through the following process:
+
+1. Sunlight enters water droplets in the air
+2. Light is refracted (bent) as it enters the droplet
+3. The light is then reflected off the back of the droplet
+4. As it exits, it's refracted again and separated into different wavelengths
+5. This separation creates the spectrum of colors we see
+6. The observer must be at the correct angle between the sun and water droplets to see the rainbow
+
+Rainbows appear as an arc because of the specific angle at which this light refraction occurs.
+<|eot_id|>""")
     ]
     wrapper.collect_calibration_data(input_output_pairs)
 
     # Analyze model state
-    analysis_results = wrapper.analyze_model_state("The quick brown fox")
-    print("Analysis Results:")
-    print(analysis_results)
+    #analysis_results = wrapper.analyze_model_state("The quick brown fox")
+    #print("Analysis Results:")
+    #print(analysis_results)
 
     # Generate and analyze text
     generation_results = wrapper.generate_and_analyze(
-        "The meaning of life is",
+        """<|start_header_id|>system<|end_header_id|>
+
+Cutting Knowledge Date: December 2023
+Today Date: 12 Oct 2024
+
+You are Claude, an AI assistant created by Anthropic to be helpful, harmless, and honest.
+<|eot_id|>
+<|start_header_id|>user<|end_header_id|>
+
+How many r's are in the word strawberry?
+<|eot_id|>
+<|start_header_id|>assistant<|end_header_id|>""",
         max_length=200,
         method='temperature',
         temperature=0.3
     )
-    print("Generation Results:")
-    print(generation_results)
+    #print("Generation Results:")
+
+    # Visualize results
+    wrapper.visualize_entropy_over_time(generation_results)
+    wrapper.visualize_hidden_state_norms(generation_results)
+    wrapper.visualize_model_states(generation_results)
+
+    # For attention heatmap and head entropies, we need the attention values
+    # Let's assume we have them from the last generation step
+    last_step_attentions = generation_results['step_analyses'][-1]['attentions']
+    last_step_tokens = wrapper.tokenizer.convert_ids_to_tokens(generation_results['generated_ids'][0])
+    wrapper.visualize_attention_heatmap(last_step_attentions, last_step_tokens)
+    wrapper.visualize_head_entropies(last_step_attentions)
+
+    # For layer activations, we need the hidden states
+    # Let's assume we have them from the last generation step
+    last_step_hidden_states = generation_results['step_analyses'][-1]['hidden_states']
+    wrapper.visualize_layer_activations(last_step_hidden_states)

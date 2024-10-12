@@ -6,7 +6,6 @@ from scipy.stats import entropy
 import matplotlib.pyplot as plt
 import seaborn as sns
 
-
 class EntropyAnalysisWrapper:
     def __init__(self, model_name, device="cuda"):
         """
@@ -95,11 +94,11 @@ class EntropyAnalysisWrapper:
                 attention_entropies.append(entropy_val)
             attention_entropy_list.extend(attention_entropies)
 
-            print(f"Input: {input_text}")
-            print(f"Output: {output_text}")
-            print(f"Logits Entropies: {logits_entropies}")
-            print(f"Attention Entropies: {attention_entropies}")
-            print("-" * 50)
+            print(f"Input: {input_text}", flush=True)
+            print(f"Output: {output_text}", flush=True)
+            print(f"Logits Entropies: {logits_entropies}", flush=True)
+            print(f"Attention Entropies: {attention_entropies}", flush=True)
+            print("-" * 50, flush=True)
 
         # Calculate mean and standard deviation
         self.logits_mean = np.mean(logits_entropy_list)
@@ -107,9 +106,9 @@ class EntropyAnalysisWrapper:
         self.attn_mean = np.mean(attention_entropy_list)
         self.attn_std = np.std(attention_entropy_list)
 
-        print(f"Logits Entropy - Mean: {self.logits_mean:.4f}, Std: {self.logits_std:.4f}")
-        print(f"Attention Entropy - Mean: {self.attn_mean:.4f}, Std: {self.attn_std:.4f}")
-        print("=" * 50)
+        print(f"Logits Entropy - Mean: {self.logits_mean:.4f}, Std: {self.logits_std:.4f}", flush=True)
+        print(f"Attention Entropy - Mean: {self.attn_mean:.4f}, Std: {self.attn_std:.4f}", flush=True)
+        print("=" * 50, flush=True)
 
     def categorize_state(self, logits_entropy, attention_entropy):
         """
@@ -164,35 +163,36 @@ class EntropyAnalysisWrapper:
 
         # Visualize attention
         input_tokens = self.tokenizer.convert_ids_to_tokens(inputs["input_ids"][0])
-        self.visualize_attention(attentions, input_tokens)
+        # Visualization code commented out to prevent interruption
+        # self.visualize_attention(attentions, input_tokens)
 
         # Output results
-        print(f"Input: {input_text}")
-        print(f"Logits Entropies: {logits_entropies}")
-        print(f"Attention Entropies: {attention_entropies}")
+        print(f"Input: {input_text}", flush=True)
+        print(f"Logits Entropies: {logits_entropies}", flush=True)
+        print(f"Attention Entropies: {attention_entropies}", flush=True)
         for stat in hidden_state_stats:
             print(f"Layer {stat['layer']} - Mean Activation: {stat['mean_activation']:.4f}, "
-                  f"Std Activation: {stat['std_activation']:.4f}")
+                  f"Std Activation: {stat['std_activation']:.4f}", flush=True)
 
         # Optional: Analyze attention heads
         head_entropies = self.analyze_attention_heads(attentions)
-        print(f"Head Entropies: {head_entropies}")
+        print(f"Head Entropies: {head_entropies}", flush=True)
 
         # Optional: Compute model uncertainty
         mean_probs, var_probs = self.mc_dropout(inputs)
         uncertainty = var_probs[0, -1, :].mean().item()
-        print(f"Model Uncertainty (Variance): {uncertainty}")
+        print(f"Model Uncertainty (Variance): {uncertainty}", flush=True)
 
         # Optional: Layer-wise activation stats
         layer_stats = self.layer_wise_activation_stats(hidden_states)
         for ls in layer_stats:
-            print(f"Layer {ls['layer']} - Norm Activation: {ls['norm_activation']:.4f}")
+            print(f"Layer {ls['layer']} - Norm Activation: {ls['norm_activation']:.4f}", flush=True)
 
         # Optionally categorize state for last token
         logits_entropy_last = logits_entropies[-1]
         attention_entropy_last = attention_entropies[-1]
         state = self.categorize_state(logits_entropy_last, attention_entropy_last)
-        print(f"Model State: {state}")
+        print(f"Model State: {state}", flush=True)
 
     def analyze_hidden_states(self, hidden_states):
         """
@@ -317,7 +317,7 @@ class EntropyAnalysisWrapper:
             outputs = self.model(**inputs, labels=inputs['input_ids'])
             loss = outputs.loss
         perplexity = torch.exp(loss).item()
-        print(f"Perplexity: {perplexity}")
+        print(f"Perplexity: {perplexity}", flush=True)
 
     def layer_wise_activation_stats(self, hidden_states):
         """
@@ -337,60 +337,135 @@ class EntropyAnalysisWrapper:
             })
         return layer_stats
 
-    def generate_text(self, input_text, max_length=50, method='temperature', **kwargs):
+    @staticmethod
+    def top_k_top_p_filtering(logits, top_k=0, top_p=0.0, filter_value=-float('Inf')):
         """
-        Generate text using different sampling methods.
+        Filter logits using top-k and/or nucleus (top-p) filtering
         """
+        # top_k filtering
+        if top_k > 0:
+            values_to_keep, _ = torch.topk(logits, top_k)
+            min_values = values_to_keep[:, -1].unsqueeze(1)
+            logits = torch.where(logits < min_values, torch.full_like(logits, filter_value), logits)
+        # top_p filtering
+        if top_p > 0.0:
+            sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
+            cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+            # Remove tokens with cumulative probability above top_p
+            sorted_indices_to_remove = cumulative_probs > top_p
+            # Shift the indices to include the first token above the threshold
+            sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+            sorted_indices_to_remove[..., 0] = 0
+            indices_to_remove = sorted_indices[sorted_indices_to_remove]
+            logits.scatter_(dim=-1, index=indices_to_remove, value=filter_value)
+        return logits
+
+    def generate_and_analyze(self, input_text, max_length=50, method='temperature', **kwargs):
+        """
+        Generate text step by step and analyze inner state during generation.
+        """
+        self.model.eval()
+        # Prepare input_ids
+        input_ids = self.tokenizer(input_text, return_tensors='pt').input_ids.to(self.device)
+        generated_ids = input_ids.clone()
+
+        # Initialize past_key_values
+        past_key_values = None
+
         self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
-        inputs = self.tokenizer(input_text, return_tensors='pt').to(self.device)
-        attention_mask = inputs['input_ids'].ne(self.tokenizer.eos_token_id).long()
-        # Prepare generation parameters
-        generation_kwargs = {
-            'input_ids': inputs['input_ids'],
-            'attention_mask': attention_mask,
-            'max_length': max_length,
-            'do_sample': True,  # Enable sampling
-            'return_dict_in_generate': True,
-            'output_attentions': True,
-            'output_hidden_states': True
-        }
+        attention_mask = generated_ids.ne(self.tokenizer.pad_token_id).long()
 
-        if method == 'temperature':
-            temperature = kwargs.get('temperature', 1.0)
-            generation_kwargs['temperature'] = temperature
-        elif method == 'top-k':
-            k = kwargs.get('k', 50)
-            generation_kwargs['top_k'] = k
-        elif method == 'top-p':
-            p = kwargs.get('p', 0.9)
-            generation_kwargs['top_p'] = p
-        elif method == 'min-p':
-            min_p = kwargs.get('min_p', 0.02)
+        print(f"Input Text: {input_text}", flush=True)
 
-            class MinPLogitsProcessor(LogitsProcessor):
-                def __init__(self, min_p):
-                    self.min_p = min_p
+        for step in range(max_length):
+            # Get model outputs
+            with torch.no_grad():
+                outputs = self.model(
+                    input_ids=generated_ids[:, -1:],  # only the last token
+                    past_key_values=past_key_values,
+                    attention_mask=attention_mask[:, -1:],
+                    use_cache=True,
+                    output_attentions=True,
+                    output_hidden_states=True
+                )
 
-                def __call__(self, input_ids, scores):
-                    probs = F.softmax(scores, dim=-1)
-                    mask = probs >= self.min_p
-                    if mask.sum() == 0:
-                        # If no tokens meet the threshold, do not filter
-                        return scores
-                    else:
-                        scores = scores.masked_fill(~mask, -float('inf'))
-                        return scores
+            # Update past_key_values
+            past_key_values = outputs.past_key_values
 
-            logits_processor = MinPLogitsProcessor(min_p)
-            generation_kwargs['logits_processor'] = [logits_processor]
-        else:
-            raise ValueError("Invalid method. Choose from 'temperature', 'top-k', 'top-p', or 'min-p'.")
+            # Get logits, attentions, hidden_states
+            logits = outputs.logits  # [batch_size, 1, vocab_size]
+            attentions = outputs.attentions  # list of tensors
+            hidden_states = outputs.hidden_states  # list of tensors
 
-        # Generate text using built-in generation methods
-        generated_outputs = self.model.generate(**generation_kwargs)
-        generated_text = self.tokenizer.decode(generated_outputs.sequences[0], skip_special_tokens=True)
-        return generated_text
+            # Calculate probabilities from logits
+            probs = F.softmax(logits[:, -1, :], dim=-1)  # [batch_size, vocab_size]
 
+            # Calculate logits entropy
+            logits_entropy = self.calculate_entropy(probs[0].cpu())
+
+            # Attention entropy for the last token
+            # Get attentions from the last layer
+            last_layer_attentions = attentions[-1][0]  # [num_heads, seq_len, seq_len]
+            # For the last generated token, get attention to previous tokens
+            attn_weights = last_layer_attentions[:, -1, :].mean(dim=0)  # [seq_len]
+            attn_weights = attn_weights / attn_weights.sum()
+            attn_weights = attn_weights[attn_weights > 0]
+            attention_entropy = self.calculate_entropy(attn_weights.cpu().numpy())
+
+            # Output analysis
+            state = self.categorize_state(logits_entropy, attention_entropy)
+
+            print(f"Step {step+1}:", flush=True)
+            print(f"Logits Entropy: {logits_entropy:.4f}", flush=True)
+            print(f"Attention Entropy: {attention_entropy:.4f}", flush=True)
+            print(f"Model State: {state}", flush=True)
+
+            # Decode generated tokens so far
+            generated_text_so_far = self.tokenizer.decode(generated_ids[0], skip_special_tokens=True)
+            print(f"Generated Text So Far: {generated_text_so_far}", flush=True)
+
+            # Sample next token
+            if method == 'temperature':
+                temperature = kwargs.get('temperature', 1.0)
+                logits = logits[:, -1, :] / temperature
+                probs = F.softmax(logits, dim=-1)
+                next_token_id = torch.multinomial(probs, num_samples=1)
+            elif method == 'top-k':
+                k = kwargs.get('k', 50)
+                logits = logits[:, -1, :]
+                filtered_logits = self.top_k_top_p_filtering(logits, top_k=k)
+                probs = F.softmax(filtered_logits, dim=-1)
+                next_token_id = torch.multinomial(probs, num_samples=1)
+            elif method == 'top-p':
+                p = kwargs.get('p', 0.9)
+                logits = logits[:, -1, :]
+                filtered_logits = self.top_k_top_p_filtering(logits, top_p=p)
+                probs = F.softmax(filtered_logits, dim=-1)
+                next_token_id = torch.multinomial(probs, num_samples=1)
+            else:
+                # Greedy decoding
+                next_token_id = torch.argmax(logits[:, -1, :], dim=-1, keepdim=True)
+
+            # Append next_token_id to generated_ids
+            generated_ids = torch.cat((generated_ids, next_token_id), dim=1)
+
+            # Update attention_mask
+            attention_mask = torch.cat((attention_mask, torch.ones_like(next_token_id)), dim=1)
+
+            # Decode generated token
+            generated_token = self.tokenizer.decode(next_token_id[0], skip_special_tokens=True)
+            print(f"Generated Token: {generated_token}", flush=True)
+            print("-" * 50, flush=True)
+
+            # If EOS token is generated, break
+            if next_token_id.item() == self.tokenizer.eos_token_id:
+                print("End of sequence reached.", flush=True)
+                break
+
+        # Final generated text
+        final_generated_text = self.tokenizer.decode(generated_ids[0], skip_special_tokens=True)
+        print("Final Generated Text:", flush=True)
+        print(final_generated_text, flush=True)
 
 # Initialize the wrapper with a model name
 wrapper = EntropyAnalysisWrapper('gpt2')
@@ -407,19 +482,8 @@ wrapper.collect_calibration_data(input_output_pairs)
 # Analyze model state at inference
 wrapper.analyze_model_state("The quick brown fox")
 
-# Generate text with different sampling methods
-generated_text_temp = wrapper.generate_text("The meaning of life is", method='temperature', temperature=0.7)
-print("Generated Text (Temperature Sampling):")
-print(generated_text_temp)
+# Generate and analyze text with the new method
+wrapper.generate_and_analyze("The meaning of life is", max_length=10, method='temperature', temperature=0.7)
 
-generated_text_topk = wrapper.generate_text("The meaning of life is", method='top-k', k=50)
-print("\nGenerated Text (Top-K Sampling):")
-print(generated_text_topk)
 
-generated_text_topp = wrapper.generate_text("The meaning of life is", method='top-p', p=0.9)
-print("\nGenerated Text (Top-P Sampling):")
-print(generated_text_topp)
-
-generated_text_minp = wrapper.generate_text("The meaning of life is", method='min-p', min_p=0.01)
-print("\nGenerated Text (Min-P Sampling):")
-print(generated_text_minp)
+wrapper.generate_and_analyze("Once upon a time", max_length=10, method='temperature', temperature=0.7)

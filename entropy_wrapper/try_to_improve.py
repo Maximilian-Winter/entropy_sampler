@@ -409,7 +409,7 @@ class BaseEntropyAnalysisWrapper(ABC):
             print(f"Error in gradient importance analysis: {e}")
 
 
-class GPT2EntropyAnalysisWrapper(BaseEntropyAnalysisWrapper):
+class BasicEntropyAnalysisWrapper(BaseEntropyAnalysisWrapper):
     def _load_model(self, model_name: str, device: str) -> AutoModelForCausalLM:
         return AutoModelForCausalLM.from_pretrained(
             model_name,
@@ -423,9 +423,9 @@ class GPT2EntropyAnalysisWrapper(BaseEntropyAnalysisWrapper):
 # Example usage
 if __name__ == "__main__":
     config = EntropyAnalysisConfig()
-    config.gradient_importance.enabled = False  # Disable gradient importance for this example
+    config.gradient_importance.enabled = False
 
-    wrapper = GPT2EntropyAnalysisWrapper('meta-llama/Llama-3.2-1B-Instruct', config=config)
+    wrapper = BasicEntropyAnalysisWrapper('meta-llama/Llama-3.2-1B-Instruct', config=config)
 
     # Collect calibration data
     input_output_pairs = [
@@ -445,7 +445,7 @@ if __name__ == "__main__":
         "The meaning of life is",
         max_length=200,
         method='temperature',
-        temperature=0.7
+        temperature=0.3
     )
     print("Generation Results:")
     print(generation_results)

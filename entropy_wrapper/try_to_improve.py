@@ -252,7 +252,7 @@ class BaseEntropyAnalysisWrapper(ABC):
         return mask
 
     def generate_and_analyze(self, input_text: str, max_length: int = 50, method: str = 'temperature',
-    **kwargs) -> Dict:
+                             **kwargs) -> Dict:
         self.model.eval()
         input_ids = self.tokenizer(input_text, return_tensors='pt').input_ids.to(self.device)
         generated_ids = input_ids.clone()

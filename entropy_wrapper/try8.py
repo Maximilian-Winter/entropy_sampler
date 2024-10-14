@@ -19,6 +19,9 @@ import logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Ensure non-deterministic algorithms are used
+torch.use_deterministic_algorithms(False)
+
 
 class ConfigurableAnalysis:
     """Configuration class for enabling or disabling specific analyses."""
@@ -292,22 +295,34 @@ class BaseEntropyAnalysisWrapper(ABC):
         Returns:
             Filtered logits tensor.
         """
+        # Clone logits to avoid modifying the original tensor
+        logits = logits.clone()
+
         # Top-k filtering
         if top_k > 0:
             top_k = min(max(top_k, 1), logits.size(-1))
-            indices_to_remove = logits < torch.topk(logits, top_k)[0][..., -1, None]
+            kth_values = torch.topk(logits, top_k)[0][..., -1, None]
+            indices_to_remove = logits < kth_values
             logits = logits.masked_fill(indices_to_remove, filter_value)
+
         # Top-p (nucleus) filtering
         if top_p > 0.0:
-            sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+            sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
             cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+
             # Remove tokens with cumulative probability above threshold
             sorted_indices_to_remove = cumulative_probs > top_p
-            # Shift the index to the right to keep the first token above the threshold
+
+            # Shift the indices to the right to keep the first token above the threshold
             sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
             sorted_indices_to_remove[..., 0] = False
-            indices_to_remove = sorted_indices[sorted_indices_to_remove]
-            logits.scatter_(dim=-1, index=indices_to_remove, value=filter_value)
+
+            # Scatter sorted tensors to original indexing
+            indices_to_remove = torch.zeros_like(logits, dtype=torch.bool)
+            indices_to_remove.scatter_(dim=-1, index=sorted_indices, src=sorted_indices_to_remove)
+
+            logits = logits.masked_fill(indices_to_remove, filter_value)
+
         return logits
 
     def generate_and_analyze(self, input_text: str, max_length: int = 50, temperature: float = 1.0,
@@ -812,6 +827,7 @@ How many r's are in the word strawberry?
             generation_input,
             max_length=200,
             temperature=0.65,
+            top_p=0.9,  # Added top_p parameter for stochastic sampling
         )
 
         # Create a timestamped folder for results

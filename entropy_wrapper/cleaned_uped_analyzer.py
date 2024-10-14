@@ -225,27 +225,6 @@ class BaseEntropyAnalysisWrapper(ABC):
             })
         return layer_stats
 
-    def analyze_attention_heads(self, attentions: List[torch.Tensor]) -> List[float]:
-        """
-        Analyze the entropy of attention distributions for each head.
-
-        Args:
-            attentions: List of attention tensors from each layer.
-
-        Returns:
-            A list of entropy values per head.
-        """
-        last_layer_attn = attentions[-1][0]  # Shape: [num_heads, seq_len, seq_len]
-        num_heads = last_layer_attn.size(0)
-        head_entropies = []
-        # Iterate over heads
-        for head in range(num_heads):
-            head_attn = last_layer_attn[head]  # Shape: [seq_len, seq_len]
-            token_attn = head_attn[-1]  # Use the last token
-            entropy_value = self.calculate_entropy(token_attn.cpu().numpy())
-            head_entropies.append(entropy_value)
-        return head_entropies
-
     def calculate_perplexity(self, input_text: str) -> float:
         """Calculate perplexity of the input text."""
         inputs = self.tokenizer(input_text, return_tensors='pt').to(self.device)
@@ -442,9 +421,6 @@ class BaseEntropyAnalysisWrapper(ABC):
                 head_entropies.append(entropy_value)
             attention_entropy = np.mean(head_entropies)
             step_analysis['attention_entropy'] = attention_entropy
-
-            # Store per-head attention entropies
-            step_analysis['attention_entropies_per_head'] = head_entropies
 
         if 'logits_entropy' in step_analysis and 'attention_entropy' in step_analysis:
             state = self.categorize_state(step_analysis['logits_entropy'], step_analysis['attention_entropy'])
@@ -645,25 +621,6 @@ class BaseEntropyAnalysisWrapper(ABC):
         plt.savefig(os.path.join(folder_name, 'entropy_thresholds.png'))
         plt.close()
 
-    # New visualization methods
-    def visualize_max_probability(self, generation_results: Dict, folder_name: str):
-        if not self.config.max_probability.enabled:
-            logger.warning("Max probability visualization is not enabled in the configuration.")
-            return
-
-        steps = range(1, len(generation_results['step_analyses']) + 1)
-        max_probs = [step['max_probability'] for step in generation_results['step_analyses']]
-
-        plt.figure(figsize=(12, 6))
-        plt.plot(steps, max_probs, label='Max Probability', marker='o')
-        plt.xlabel('Generation Step')
-        plt.ylabel('Max Probability')
-        plt.title('Max Probability Over Time')
-        plt.legend()
-        plt.grid(True)
-        plt.savefig(os.path.join(folder_name, 'max_probability_over_time.png'))
-        plt.close()
-
     def visualize_surprisal(self, generation_results: Dict, folder_name: str):
         if not self.config.surprisal.enabled:
             logger.warning("Surprisal visualization is not enabled in the configuration.")
@@ -681,32 +638,6 @@ class BaseEntropyAnalysisWrapper(ABC):
         plt.grid(True)
         plt.savefig(os.path.join(folder_name, 'surprisal_over_time.png'))
         plt.close()
-
-
-    def visualize_attention_entropies_per_head(self, generation_results: Dict, folder_name: str):
-        if not self.config.attention_entropy.enabled:
-            logger.warning("Attention entropy visualization is not enabled in the configuration.")
-            return
-
-        steps = range(1, len(generation_results['step_analyses']) + 1)
-        attention_entropies_per_step = [step['attention_entropies_per_head'] for step in
-                                        generation_results['step_analyses']]
-
-        # Transpose to get entropies per head
-        attention_entropies_per_head = list(zip(*attention_entropies_per_step))
-        num_heads = len(attention_entropies_per_head)
-
-        plt.figure(figsize=(12, 6))
-        for head_idx, entropies in enumerate(attention_entropies_per_head):
-            plt.plot(steps, entropies, label=f'Head {head_idx}')
-        plt.xlabel('Generation Step')
-        plt.ylabel('Attention Entropy')
-        plt.title('Attention Entropy Per Head Over Time')
-        plt.legend()
-        plt.grid(True)
-        plt.savefig(os.path.join(folder_name, 'attention_entropies_per_head.png'))
-        plt.close()
-
 
 class BasicEntropyAnalysisWrapper(BaseEntropyAnalysisWrapper):
     def _load_model(self, model_name: str, device: str) -> AutoModelForCausalLM:
@@ -1058,9 +989,7 @@ Which number is bigger 9.11 or 9.9?
                                            folder_name=results_folder)
 
         # New visualizations
-        wrapper.visualize_max_probability(generation_results, results_folder)
         wrapper.visualize_surprisal(generation_results, results_folder)
-        wrapper.visualize_attention_entropies_per_head(generation_results, results_folder)
         generate_html_report(
             generation_results,
             wrapper,

@@ -1,3 +1,7 @@
+import datetime
+import json
+import os
+
 import pandas as pd
 import torch
 import torch.nn.functional as F
@@ -40,6 +44,7 @@ class BaseEntropyAnalysisWrapper(ABC):
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         self.device = device
         self.model = self._load_model(model_name, device)
+        self.model_name = model_name
         self.config = config or EntropyAnalysisConfig()
         self.logits_entropy_thresholds = {}
         self.attn_entropy_thresholds = {}
@@ -468,13 +473,7 @@ class BaseEntropyAnalysisWrapper(ABC):
         except Exception as e:
             logger.error(f"Error in attention visualization: {e}", exc_info=True)
 
-    def visualize_entropy_over_time(self, generation_results: Dict):
-        """
-        Visualize the entropy of logits and attention over the generation steps.
-
-        Args:
-            generation_results: Dictionary containing generation results and analyses.
-        """
+    def visualize_entropy_over_time(self, generation_results: Dict, folder_name: str):
         if not (self.config.logits_entropy.enabled and self.config.attention_entropy.enabled):
             logger.warning("Logits and attention entropy visualization is not enabled in the configuration.")
             return
@@ -491,15 +490,10 @@ class BaseEntropyAnalysisWrapper(ABC):
         plt.title('Entropy Over Time')
         plt.legend()
         plt.grid(True)
-        plt.show()
+        plt.savefig(os.path.join(folder_name, 'entropy_over_time.png'))
+        plt.close()
 
-    def visualize_model_states(self, generation_results: Dict):
-        """
-        Visualize the model's state over the generation steps.
-
-        Args:
-            generation_results: Dictionary containing generation results and analyses.
-        """
+    def visualize_model_states(self, generation_results: Dict, folder_name: str):
         if not generation_results['step_analyses']:
             logger.warning("No step analyses available for visualization.")
             return
@@ -521,9 +515,10 @@ class BaseEntropyAnalysisWrapper(ABC):
         plt.ylabel('Model State')
         plt.title('Model State Over Time')
         plt.grid(True)
-        plt.show()
+        plt.savefig(os.path.join(folder_name, 'model_states.png'))
+        plt.close()
 
-    def visualize_entropy_distribution(self, generation_results: Dict):
+    def visualize_entropy_distribution(self, generation_results: Dict, folder_name: str):
         logits_entropies = [step['logits_entropy'] for step in generation_results['step_analyses']]
         attention_entropies = [step['attention_entropy'] for step in generation_results['step_analyses']]
 
@@ -539,28 +534,18 @@ class BaseEntropyAnalysisWrapper(ABC):
         plt.xlabel('Entropy')
 
         plt.tight_layout()
-        plt.show()
-
-    def visualize_attention_head_entropy(self, attentions: List[torch.Tensor]):
-        last_layer_attn = attentions[-1][0]  # Shape: [num_heads, seq_len, seq_len]
-        num_heads, seq_len, _ = last_layer_attn.shape
-
-        head_entropies = np.zeros((num_heads, seq_len))
-        for head in range(num_heads):
-            for token in range(seq_len):
-                head_entropies[head, token] = self.calculate_entropy(last_layer_attn[head, token].cpu().numpy())
-
-        plt.figure(figsize=(12, 8))
-        sns.heatmap(head_entropies, cmap='viridis')
-        plt.title('Attention Head Entropy')
-        plt.xlabel('Token Position')
-        plt.ylabel('Attention Head')
-        plt.show()
+        plt.savefig(os.path.join(folder_name, 'entropy_distribution.png'))
+        plt.close()
 
     def rolling_entropy(self, entropies: List[float], window: int = 5):
         return pd.Series(entropies).rolling(window=window).mean().tolist()
 
-    def visualize_rolling_entropy(self, generation_results: Dict, window: int = 5):
+    def entropy_gradient(self, entropies: List[float]):
+        if len(entropies) < 2:
+            return []  # Return an empty list if there's not enough data for gradient calculation
+        return np.gradient(entropies)
+
+    def visualize_rolling_entropy(self, generation_results: Dict, folder_name: str, window: int = 5):
         steps = range(1, len(generation_results['step_analyses']) + 1)
         logits_entropies = [step['logits_entropy'] for step in generation_results['step_analyses']]
         attention_entropies = [step['attention_entropy'] for step in generation_results['step_analyses']]
@@ -576,21 +561,16 @@ class BaseEntropyAnalysisWrapper(ABC):
         plt.title(f'Rolling Entropy Over Time (Window = {window})')
         plt.legend()
         plt.grid(True)
-        plt.show()
+        plt.savefig(os.path.join(folder_name, 'rolling_entropy.png'))
+        plt.close()
 
-    def entropy_gradient(self, entropies: List[float]):
-        if len(entropies) < 2:
-            return []  # Return an empty list if there's not enough data for gradient calculation
-        return np.gradient(entropies)
-
-    def visualize_entropy_gradient(self, generation_results: Dict):
+    def visualize_entropy_gradient(self, generation_results: Dict, folder_name: str):
         logits_entropies = [step['logits_entropy'] for step in generation_results['step_analyses']]
         attention_entropies = [step['attention_entropy'] for step in generation_results['step_analyses']]
 
         logits_gradient = self.entropy_gradient(logits_entropies)
         attention_gradient = self.entropy_gradient(attention_entropies)
 
-        # Adjust steps to match the length of gradient arrays
         steps = range(1, len(logits_gradient) + 1)
 
         plt.figure(figsize=(12, 6))
@@ -601,9 +581,10 @@ class BaseEntropyAnalysisWrapper(ABC):
         plt.title('Entropy Gradient Over Time')
         plt.legend()
         plt.grid(True)
-        plt.show()
+        plt.savefig(os.path.join(folder_name, 'entropy_gradient.png'))
+        plt.close()
 
-    def analyze_entropy_correlation(self, generation_results: Dict):
+    def analyze_entropy_correlation(self, generation_results: Dict, folder_name: str):
         logits_entropies = [step['logits_entropy'] for step in generation_results['step_analyses']]
         attention_entropies = [step['attention_entropy'] for step in generation_results['step_analyses']]
 
@@ -615,11 +596,13 @@ class BaseEntropyAnalysisWrapper(ABC):
         plt.ylabel('Attention Entropy')
         plt.title(f'Logits vs Attention Entropy (Correlation: {correlation:.2f})')
         plt.grid(True)
-        plt.show()
+        plt.savefig(os.path.join(folder_name, 'entropy_correlation.png'))
+        plt.close()
 
         return correlation
 
-    def analyze_entropy_thresholds(self, generation_results: Dict, logits_threshold: float, attention_threshold: float):
+    def analyze_entropy_thresholds(self, generation_results: Dict, logits_threshold: float, attention_threshold: float,
+                                   folder_name: str):
         steps = range(1, len(generation_results['step_analyses']) + 1)
         logits_entropies = [step['logits_entropy'] for step in generation_results['step_analyses']]
         attention_entropies = [step['attention_entropy'] for step in generation_results['step_analyses']]
@@ -636,12 +619,12 @@ class BaseEntropyAnalysisWrapper(ABC):
         plt.legend()
         plt.ylim(-0.1, 1.1)
         plt.grid(True)
-        plt.show()
+        plt.savefig(os.path.join(folder_name, 'entropy_thresholds.png'))
+        plt.close()
 
 
 class BasicEntropyAnalysisWrapper(BaseEntropyAnalysisWrapper):
     def _load_model(self, model_name: str, device: str) -> AutoModelForCausalLM:
-        """Load the causal language model with required configurations."""
         model = AutoModelForCausalLM.from_pretrained(
             model_name,
             attn_implementation="eager",
@@ -650,6 +633,39 @@ class BasicEntropyAnalysisWrapper(BaseEntropyAnalysisWrapper):
             output_hidden_states=True,
         )
         return model.to(device)
+
+
+def create_timestamped_folder():
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    folder_name = f"analysis_results_{timestamp}"
+    os.makedirs(folder_name, exist_ok=True)
+    return folder_name
+
+
+def save_generation_results(generation_results: Dict, folder_name: str):
+    results = {}
+    for k, v in generation_results.items():
+        if isinstance(v, torch.Tensor):
+            v = v.tolist()
+        results[k] = v
+    with open(os.path.join(folder_name, 'generation_results.json'), 'w') as f:
+        json.dump(results, f, indent=2)
+
+
+def save_metadata(wrapper: BaseEntropyAnalysisWrapper, config: EntropyAnalysisConfig, folder_name: str):
+    metadata = {
+        "model_name": wrapper.model_name,
+        "device": wrapper.device,
+        "logits_entropy_enabled": config.logits_entropy.enabled,
+        "attention_entropy_enabled": config.attention_entropy.enabled,
+        "mc_dropout_enabled": config.mc_dropout.enabled,
+        "perplexity_enabled": config.perplexity.enabled,
+        "logits_entropy_thresholds": wrapper.logits_entropy_thresholds,
+        "attn_entropy_thresholds": wrapper.attn_entropy_thresholds,
+        "timestamp": datetime.datetime.now().isoformat()
+    }
+    with open(os.path.join(folder_name, 'metadata.json'), 'w') as f:
+        json.dump(metadata, f, indent=2)
 
 
 if __name__ == "__main__":
@@ -779,7 +795,7 @@ Rainbows appear as an arc because of the specific angle at which this light refr
 Cutting Knowledge Date: December 2023
 Today Date: 12 Oct 2024
 
-You are an AI assistant created to be helpful and honest. Always think step by step and layout your chain of thought in great detail.
+You are a helpful Assistant.
 <|eot_id|>
 <|start_header_id|>user<|end_header_id|>
 
@@ -793,13 +809,22 @@ How many r's are in the word strawberry?
         temperature=0.3,
     )
 
-    # Visualize results
-    wrapper.visualize_entropy_over_time(generation_results)
-    wrapper.visualize_model_states(generation_results)
-    wrapper.visualize_entropy_over_time(generation_results)
-    wrapper.visualize_model_states(generation_results)
-    wrapper.visualize_entropy_distribution(generation_results)
-    wrapper.visualize_rolling_entropy(generation_results)
-    wrapper.visualize_entropy_gradient(generation_results)
-    correlation = wrapper.analyze_entropy_correlation(generation_results)
-    wrapper.analyze_entropy_thresholds(generation_results, logits_threshold=2.0, attention_threshold=1.5)
+    # Create a timestamped folder for results
+    results_folder = create_timestamped_folder()
+
+    # Save metadata
+    save_metadata(wrapper, config, results_folder)
+
+    # Save generation results
+    save_generation_results(generation_results, results_folder)
+
+    # Generate and save visualizations
+    wrapper.visualize_entropy_over_time(generation_results, results_folder)
+    wrapper.visualize_model_states(generation_results, results_folder)
+    wrapper.visualize_entropy_distribution(generation_results, results_folder)
+    wrapper.visualize_rolling_entropy(generation_results, results_folder)
+    wrapper.visualize_entropy_gradient(generation_results, results_folder)
+    correlation = wrapper.analyze_entropy_correlation(generation_results, results_folder)
+    wrapper.analyze_entropy_thresholds(generation_results, logits_threshold=2.0, attention_threshold=1.5, folder_name=results_folder)
+
+    print(f"Analysis results, visualizations, and metadata saved in folder: {results_folder}")

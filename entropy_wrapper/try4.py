@@ -18,12 +18,8 @@ class EntropyAnalysisConfig:
     def __init__(self):
         self.logits_entropy = ConfigurableAnalysis()
         self.attention_entropy = ConfigurableAnalysis()
-        self.hidden_states = ConfigurableAnalysis()
-        self.head_entropies = ConfigurableAnalysis()
         self.mc_dropout = ConfigurableAnalysis()
-        self.gradient_importance = ConfigurableAnalysis()
         self.perplexity = ConfigurableAnalysis()
-        self.layer_wise_activation = ConfigurableAnalysis()
 
 
 class BaseEntropyAnalysisWrapper(ABC):
@@ -47,7 +43,7 @@ class BaseEntropyAnalysisWrapper(ABC):
         return entropy(probs, base=2)
 
     def calculate_sequence_entropy(self, probs: torch.Tensor) -> List[float]:
-        return [self.calculate_entropy(token_probs[token_probs > 0].cpu().numpy()) for token_probs in probs]
+        return [self.calculate_entropy(token_probs.cpu().numpy()) for token_probs in probs]
 
     def collect_calibration_data(self, input_output_pairs: List[Tuple[str, str]]) -> None:
         logits_entropy_list = []
@@ -55,8 +51,19 @@ class BaseEntropyAnalysisWrapper(ABC):
 
         for input_text, output_text in input_output_pairs:
             try:
-                full_text = input_text + output_text
-                inputs = self.tokenizer(full_text, return_tensors='pt').to(self.device)
+                # Tokenize input_text and output_text separately
+                inputs_input = self.tokenizer(input_text, return_tensors='pt').to(self.device)
+                inputs_output = self.tokenizer(output_text, return_tensors='pt').to(self.device)
+
+                # Concatenate input_ids
+                input_ids = torch.cat([inputs_input['input_ids'], inputs_output['input_ids']], dim=1)
+                attention_mask = torch.cat([inputs_input['attention_mask'], inputs_output['attention_mask']], dim=1)
+
+                # Get the position where output_text starts
+                output_start = inputs_input['input_ids'].size(1)
+
+                # Prepare inputs for the model
+                inputs = {'input_ids': input_ids, 'attention_mask': attention_mask}
 
                 with torch.no_grad():
                     outputs = self.model(**inputs, output_attentions=True)
@@ -66,13 +73,17 @@ class BaseEntropyAnalysisWrapper(ABC):
 
                 probs = F.softmax(logits, dim=-1)
                 sequence_probs = probs[0]
-                logits_entropies = self.calculate_sequence_entropy(sequence_probs)
-                logits_entropy_list.extend(logits_entropies)
+                # Only get entropies for the tokens corresponding to output_text
+                output_probs = sequence_probs[output_start:]
+                logits_entropies = self.calculate_sequence_entropy(output_probs)
+                logits_entropy_list.append(logits_entropies[-1])  # Collect only the last token's entropy
 
                 last_layer_attentions = attentions[-1][0].mean(dim=0)
+                # Only get attentions corresponding to output_text tokens
+                output_attn_weights = last_layer_attentions[output_start:]
                 attention_entropies = [self.calculate_entropy(attn_weights.cpu().numpy())
-                                       for attn_weights in last_layer_attentions]
-                attention_entropy_list.extend(attention_entropies)
+                                       for attn_weights in output_attn_weights]
+                attention_entropy_list.append(attention_entropies[-1])  # Collect only the last token's entropy
 
                 print(f"Input: {input_text}")
                 print(f"Output: {output_text}")
@@ -130,22 +141,10 @@ class BaseEntropyAnalysisWrapper(ABC):
                                        for attn_weights in last_layer_attentions]
                 analysis_results['attention_entropies'] = attention_entropies
 
-            if self.config.hidden_states.enabled:
-                hidden_state_stats = self.analyze_hidden_states(hidden_states)
-                analysis_results['hidden_state_stats'] = hidden_state_stats
-
-            if self.config.head_entropies.enabled:
-                head_entropies = self.analyze_attention_heads(attentions)
-                analysis_results['head_entropies'] = head_entropies
-
             if self.config.mc_dropout.enabled:
                 mean_probs, var_probs = self.mc_dropout(inputs)
                 uncertainty = var_probs[0, -1, :].mean().item()
                 analysis_results['mc_dropout_uncertainty'] = uncertainty
-
-            if self.config.layer_wise_activation.enabled:
-                layer_stats = self.layer_wise_activation_stats(hidden_states)
-                analysis_results['layer_wise_activation_stats'] = layer_stats
 
             if self.config.perplexity.enabled:
                 perplexity = self.calculate_perplexity(input_text)
@@ -291,9 +290,9 @@ class BaseEntropyAnalysisWrapper(ABC):
                 generated_ids = torch.cat((generated_ids, next_token_id), dim=1)
 
                 # Update past_length after generating a new token
-                past_length = generated_ids.size(1) - 1
+                past_length += 1
 
-                generated_token = self.tokenizer.decode(next_token_id[0], skip_special_tokens=True)
+                generated_token = self.tokenizer.decode(next_token_id[0], skip_special_tokens=False)
                 print(f"Step {step + 1} - Generated Token: {generated_token}")
                 # print(f"Step Analysis: {step_analysis}")
                 print("-" * 50)
@@ -306,7 +305,7 @@ class BaseEntropyAnalysisWrapper(ABC):
                 print(f"Error in generation step {step + 1}: {e}")
                 break
 
-        final_generated_text = self.tokenizer.decode(generated_ids[0], skip_special_tokens=True)
+        final_generated_text = self.tokenizer.decode(generated_ids[0], skip_special_tokens=False)
         print("Final Generated Text:")
         print(final_generated_text)
 
@@ -318,7 +317,7 @@ class BaseEntropyAnalysisWrapper(ABC):
 
     def analyze_step(self, logits: torch.Tensor, attentions: List[torch.Tensor],
                      hidden_states: List[torch.Tensor]) -> Dict:
-        step_analysis = {"attentions": attentions, "hidden_states": hidden_states}
+        step_analysis = {}
 
         if self.config.logits_entropy.enabled:
             probs = F.softmax(logits[:, -1, :], dim=-1)
@@ -330,11 +329,6 @@ class BaseEntropyAnalysisWrapper(ABC):
             attn_weights = last_layer_attentions[:, -1, :].mean(dim=0)
             attention_entropy = self.calculate_entropy(attn_weights.cpu().numpy())
             step_analysis['attention_entropy'] = attention_entropy
-
-        if self.config.hidden_states.enabled:
-            last_hidden_state = hidden_states[-1]
-            hidden_state_norm = last_hidden_state.norm().item()
-            step_analysis['hidden_state_norm'] = hidden_state_norm
 
         if 'logits_entropy' in step_analysis and 'attention_entropy' in step_analysis:
             state = self.categorize_state(step_analysis['logits_entropy'], step_analysis['attention_entropy'])
@@ -383,32 +377,6 @@ class BaseEntropyAnalysisWrapper(ABC):
         except Exception as e:
             print(f"Error in attention visualization: {e}")
 
-    def gradient_importance(self, input_text: str) -> None:
-        if not self.config.gradient_importance.enabled:
-            print("Gradient importance analysis is not enabled in the configuration.")
-            return
-
-        try:
-            inputs = self.tokenizer(input_text, return_tensors='pt').to(self.device)
-            self.model.zero_grad()
-            embeddings = self.model.get_input_embeddings()(inputs['input_ids'])
-            embeddings.retain_grad()
-            outputs = self.model(inputs_embeds=embeddings)
-            loss = outputs.logits[:, -1, :].mean()
-            loss.backward()
-            gradients = embeddings.grad
-            gradient_importance = gradients.abs().sum(dim=-1).squeeze().cpu().numpy()
-            tokens = self.tokenizer.convert_ids_to_tokens(inputs['input_ids'][0])
-
-            plt.figure(figsize=(12, 6))
-            plt.bar(range(len(tokens)), gradient_importance)
-            plt.xticks(range(len(tokens)), tokens, rotation='vertical')
-            plt.title('Gradient Importance')
-            plt.tight_layout()
-            plt.show()
-        except Exception as e:
-            print(f"Error in gradient importance analysis: {e}")
-
     def visualize_entropy_over_time(self, generation_results: Dict):
         if not (self.config.logits_entropy.enabled and self.config.attention_entropy.enabled):
             print("Logits and attention entropy visualization is not enabled in the configuration.")
@@ -425,22 +393,6 @@ class BaseEntropyAnalysisWrapper(ABC):
         plt.ylabel('Entropy')
         plt.title('Entropy Over Time')
         plt.legend()
-        plt.grid(True)
-        plt.show()
-
-    def visualize_hidden_state_norms(self, generation_results: Dict):
-        if not self.config.hidden_states.enabled:
-            print("Hidden state visualization is not enabled in the configuration.")
-            return
-
-        steps = range(1, len(generation_results['step_analyses']) + 1)
-        hidden_state_norms = [step['hidden_state_norm'] for step in generation_results['step_analyses']]
-
-        plt.figure(figsize=(12, 6))
-        plt.plot(steps, hidden_state_norms, marker='o')
-        plt.xlabel('Generation Step')
-        plt.ylabel('Hidden State Norm')
-        plt.title('Hidden State Norm Over Time')
         plt.grid(True)
         plt.show()
 
@@ -464,64 +416,6 @@ class BaseEntropyAnalysisWrapper(ABC):
         plt.grid(True)
         plt.show()
 
-    def visualize_attention_heatmap(self, attentions: List[torch.Tensor], tokens: List[str]):
-        if not self.config.attention_entropy.enabled:
-            print("Attention visualization is not enabled in the configuration.")
-            return
-
-        last_layer_attn = attentions[-1][0]  # [num_heads, seq_len, seq_len]
-        avg_attn = last_layer_attn.mean(dim=0)  # [seq_len, seq_len]
-
-        plt.figure(figsize=(12, 10))
-        sns.heatmap(avg_attn.cpu().numpy(), xticklabels=tokens, yticklabels=tokens, cmap='viridis')
-        plt.title('Average Attention Heatmap')
-        plt.xlabel('Key Positions')
-        plt.ylabel('Query Positions')
-        plt.tight_layout()
-        plt.show()
-
-    def visualize_head_entropies(self, attentions: List[torch.Tensor]):
-        if not self.config.head_entropies.enabled:
-            print("Head entropies visualization is not enabled in the configuration.")
-            return
-
-        last_layer_attn = attentions[-1][0]  # [num_heads, seq_len, seq_len]
-        num_heads = last_layer_attn.size(0)
-        head_entropies = [self.calculate_entropy(last_layer_attn[head][-1, :].cpu().numpy()) for head in
-                          range(num_heads)]
-
-        plt.figure(figsize=(12, 6))
-        plt.bar(range(num_heads), head_entropies)
-        plt.xlabel('Attention Head')
-        plt.ylabel('Entropy')
-        plt.title('Entropy of Attention Heads')
-        plt.xticks(range(num_heads))
-        plt.grid(axis='y')
-        plt.show()
-
-    def visualize_layer_activations(self, hidden_states: List[torch.Tensor]):
-        if not self.config.layer_wise_activation.enabled:
-            print("Layer-wise activation visualization is not enabled in the configuration.")
-            return
-
-        layer_stats = self.layer_wise_activation_stats(hidden_states)
-        layers = [stat['layer'] for stat in layer_stats]
-        mean_activations = [stat['mean_activation'] for stat in layer_stats]
-        std_activations = [stat['std_activation'] for stat in layer_stats]
-        norm_activations = [stat['norm_activation'] for stat in layer_stats]
-
-        plt.figure(figsize=(12, 8))
-        plt.plot(layers, mean_activations, label='Mean Activation', marker='o')
-        plt.plot(layers, std_activations, label='Std Activation', marker='s')
-        plt.plot(layers, norm_activations, label='Norm Activation', marker='^')
-        plt.xlabel('Layer')
-        plt.ylabel('Activation')
-        plt.title('Layer-wise Activation Statistics')
-        plt.legend()
-        plt.grid(True)
-        plt.show()
-
-
 class BasicEntropyAnalysisWrapper(BaseEntropyAnalysisWrapper):
     def _load_model(self, model_name: str, device: str) -> AutoModelForCausalLM:
         return AutoModelForCausalLM.from_pretrained(
@@ -536,7 +430,6 @@ class BasicEntropyAnalysisWrapper(BaseEntropyAnalysisWrapper):
 # Example usage
 if __name__ == "__main__":
     config = EntropyAnalysisConfig()
-    config.gradient_importance.enabled = False
 
     wrapper = BasicEntropyAnalysisWrapper('meta-llama/Llama-3.2-1B-Instruct', config=config)
 
@@ -547,7 +440,7 @@ if __name__ == "__main__":
 Cutting Knowledge Date: December 2023
 Today Date: 12 Oct 2024
 
-You are Claude, an AI assistant created by Anthropic to be helpful, harmless, and honest.
+You are an AI assistant created to be helpful and honest. Always think step by step and layout your chain of thought in great detail.
 <|eot_id|>
 <|start_header_id|>user<|end_header_id|>
 
@@ -562,7 +455,7 @@ The capital of France is Paris.
 Cutting Knowledge Date: December 2023
 Today Date: 12 Oct 2024
 
-You are Claude, an AI assistant created by Anthropic to be helpful, harmless, and honest.
+You are an AI assistant created to be helpful and honest. Always think step by step and layout your chain of thought in great detail.
 <|eot_id|>
 <|start_header_id|>user<|end_header_id|>
 
@@ -584,7 +477,7 @@ This process is crucial for life on Earth as it produces oxygen and forms the ba
 Cutting Knowledge Date: December 2023
 Today Date: 12 Oct 2024
 
-You are Claude, an AI assistant created by Anthropic to be helpful, harmless, and honest.
+You are an AI assistant created to be helpful and honest. Always think step by step and layout your chain of thought in great detail.
 <|eot_id|>
 <|start_header_id|>user<|end_header_id|>
 
@@ -603,7 +496,7 @@ New life awakens
 Cutting Knowledge Date: December 2023
 Today Date: 12 Oct 2024
 
-You are Claude, an AI assistant created by Anthropic to be helpful, harmless, and honest.
+You are an AI assistant created to be helpful and honest. Always think step by step and layout your chain of thought in great detail.
 <|eot_id|>
 <|start_header_id|>user<|end_header_id|>
 
@@ -624,7 +517,7 @@ Each state has distinct properties based on the arrangement and movement of part
 Cutting Knowledge Date: December 2023
 Today Date: 12 Oct 2024
 
-You are Claude, an AI assistant created by Anthropic to be helpful, harmless, and honest.
+You are an AI assistant created to be helpful and honest. Always think step by step and layout your chain of thought in great detail.
 <|eot_id|>
 <|start_header_id|>user<|end_header_id|>
 
@@ -645,11 +538,6 @@ Rainbows appear as an arc because of the specific angle at which this light refr
     ]
     wrapper.collect_calibration_data(input_output_pairs)
 
-    # Analyze model state
-    #analysis_results = wrapper.analyze_model_state("The quick brown fox")
-    #print("Analysis Results:")
-    #print(analysis_results)
-
     # Generate and analyze text
     generation_results = wrapper.generate_and_analyze(
         """<|start_header_id|>system<|end_header_id|>
@@ -657,7 +545,7 @@ Rainbows appear as an arc because of the specific angle at which this light refr
 Cutting Knowledge Date: December 2023
 Today Date: 12 Oct 2024
 
-You are Claude, an AI assistant created by Anthropic to be helpful, harmless, and honest.
+You are an AI assistant created to be helpful and honest. Always think step by step and layout your chain of thought in great detail.
 <|eot_id|>
 <|start_header_id|>user<|end_header_id|>
 
@@ -668,21 +556,7 @@ How many r's are in the word strawberry?
         method='temperature',
         temperature=0.3
     )
-    #print("Generation Results:")
 
     # Visualize results
     wrapper.visualize_entropy_over_time(generation_results)
-    wrapper.visualize_hidden_state_norms(generation_results)
     wrapper.visualize_model_states(generation_results)
-
-    # For attention heatmap and head entropies, we need the attention values
-    # Let's assume we have them from the last generation step
-    last_step_attentions = generation_results['step_analyses'][-1]['attentions']
-    last_step_tokens = wrapper.tokenizer.convert_ids_to_tokens(generation_results['generated_ids'][0])
-    wrapper.visualize_attention_heatmap(last_step_attentions, last_step_tokens)
-    wrapper.visualize_head_entropies(last_step_attentions)
-
-    # For layer activations, we need the hidden states
-    # Let's assume we have them from the last generation step
-    last_step_hidden_states = generation_results['step_analyses'][-1]['hidden_states']
-    wrapper.visualize_layer_activations(last_step_hidden_states)

@@ -1,0 +1,32 @@
+Certainly. I'll summarize the key points from the text content you've shared about the method for creating accurate AI responses:
+
+1. Noun-Phrase Dominance Model:
+   The author proposes a model stating that Large Language Models (LLMs) self-organize around noun phrases during training. This is because language itself is structured around noun phrases.
+
+2. Cause of Hallucinations:
+   The author identifies "noun-phrase collisions" as a primary cause of AI hallucinations. This occurs when the same noun phrase is used to refer to different entities or concepts within the AI's knowledge base.
+
+3. RAG SOD vs RAG FF:
+   The current state-of-the-art method, Retrieval Augmented Generation with Slices of Documents (RAG SOD), is criticized as ineffective. The author proposes a new method called RAG FF (Formatted Facts) or RAG FFF (Fully-Formatted Facts).
+
+4. Formatted Facts (FF) Properties:
+   - Their literal independent meaning is true
+   - They are devoid of noun-phrase conflicts with other facts
+   - They are simple, well-formed, complete sentences
+
+5. Eliminating Hallucinations:
+   The author suggests that eliminating noun-phrase collisions is key to eliminating hallucinations. This involves:
+   - Using coreference resolution to identify when different phrases refer to the same entity
+   - Employing Named Entity Recognition (NER) to identify and categorize key subjects in text
+   - Standardizing sentences into simple, well-formed statements
+
+6. Multi-Variate Named Entities:
+   For complex systems dealing with large amounts of data (like the entire internet), the author proposes using "multi-variate named entities" to disambiguate between entities with the same name.
+
+7. Context vs Noun-Phrase Paths:
+   The author argues that LLMs are more influenced by noun-phrase paths than by context, contrary to common belief. This explains why LLMs sometimes produce responses that ignore provided context.
+
+8. Proposed Solution:
+   The author suggests a method that ensures all potential noun-phrase paths result in true statements, while still allowing the AI to creatively traverse these paths based on probabilities.
+
+The author claims that this method can produce hallucination-free, accurate, and relevant responses, even when dealing with large and complex knowledge bases. However, it's important to note that this is the author's proposed model and method, and it would require rigorous testing and peer review to verify its effectiveness.

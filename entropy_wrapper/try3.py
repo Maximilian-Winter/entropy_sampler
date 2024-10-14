@@ -47,7 +47,7 @@ class BaseEntropyAnalysisWrapper(ABC):
         return entropy(probs, base=2)
 
     def calculate_sequence_entropy(self, probs: torch.Tensor) -> List[float]:
-        return [self.calculate_entropy(token_probs[token_probs > 0].cpu().numpy()) for token_probs in probs]
+        return [self.calculate_entropy(token_probs.cpu().numpy()) for token_probs in probs]
 
     def collect_calibration_data(self, input_output_pairs: List[Tuple[str, str]]) -> None:
         logits_entropy_list = []
@@ -55,8 +55,19 @@ class BaseEntropyAnalysisWrapper(ABC):
 
         for input_text, output_text in input_output_pairs:
             try:
-                full_text = input_text + output_text
-                inputs = self.tokenizer(full_text, return_tensors='pt').to(self.device)
+                # Tokenize input_text and output_text separately
+                inputs_input = self.tokenizer(input_text, return_tensors='pt').to(self.device)
+                inputs_output = self.tokenizer(output_text, return_tensors='pt').to(self.device)
+
+                # Concatenate input_ids
+                input_ids = torch.cat([inputs_input['input_ids'], inputs_output['input_ids']], dim=1)
+                attention_mask = torch.cat([inputs_input['attention_mask'], inputs_output['attention_mask']], dim=1)
+
+                # Get the position where output_text starts
+                output_start = inputs_input['input_ids'].size(1)
+
+                # Prepare inputs for the model
+                inputs = {'input_ids': input_ids, 'attention_mask': attention_mask}
 
                 with torch.no_grad():
                     outputs = self.model(**inputs, output_attentions=True)
@@ -66,13 +77,17 @@ class BaseEntropyAnalysisWrapper(ABC):
 
                 probs = F.softmax(logits, dim=-1)
                 sequence_probs = probs[0]
-                logits_entropies = self.calculate_sequence_entropy(sequence_probs)
-                logits_entropy_list.extend(logits_entropies)
+                # Only get entropies for the tokens corresponding to output_text
+                output_probs = sequence_probs[output_start:]
+                logits_entropies = self.calculate_sequence_entropy(output_probs)
+                logits_entropy_list.append(logits_entropies[-1])  # Collect only the last token's entropy
 
                 last_layer_attentions = attentions[-1][0].mean(dim=0)
+                # Only get attentions corresponding to output_text tokens
+                output_attn_weights = last_layer_attentions[output_start:]
                 attention_entropies = [self.calculate_entropy(attn_weights.cpu().numpy())
-                                       for attn_weights in last_layer_attentions]
-                attention_entropy_list.extend(attention_entropies)
+                                       for attn_weights in output_attn_weights]
+                attention_entropy_list.append(attention_entropies[-1])  # Collect only the last token's entropy
 
                 print(f"Input: {input_text}")
                 print(f"Output: {output_text}")
@@ -291,7 +306,7 @@ class BaseEntropyAnalysisWrapper(ABC):
                 generated_ids = torch.cat((generated_ids, next_token_id), dim=1)
 
                 # Update past_length after generating a new token
-                past_length = generated_ids.size(1) - 1
+                past_length += 1
 
                 generated_token = self.tokenizer.decode(next_token_id[0], skip_special_tokens=True)
                 print(f"Step {step + 1} - Generated Token: {generated_token}")
@@ -318,7 +333,7 @@ class BaseEntropyAnalysisWrapper(ABC):
 
     def analyze_step(self, logits: torch.Tensor, attentions: List[torch.Tensor],
                      hidden_states: List[torch.Tensor]) -> Dict:
-        step_analysis = {"attentions": attentions, "hidden_states": hidden_states}
+        step_analysis = {}
 
         if self.config.logits_entropy.enabled:
             probs = F.softmax(logits[:, -1, :], dim=-1)
@@ -547,7 +562,7 @@ if __name__ == "__main__":
 Cutting Knowledge Date: December 2023
 Today Date: 12 Oct 2024
 
-You are Claude, an AI assistant created by Anthropic to be helpful, harmless, and honest.
+You are an AI assistant created to be helpful and honest. Always think step by step and layout your chain of thought in great detail.
 <|eot_id|>
 <|start_header_id|>user<|end_header_id|>
 
@@ -562,7 +577,7 @@ The capital of France is Paris.
 Cutting Knowledge Date: December 2023
 Today Date: 12 Oct 2024
 
-You are Claude, an AI assistant created by Anthropic to be helpful, harmless, and honest.
+You are an AI assistant created to be helpful and honest. Always think step by step and layout your chain of thought in great detail.
 <|eot_id|>
 <|start_header_id|>user<|end_header_id|>
 
@@ -584,7 +599,7 @@ This process is crucial for life on Earth as it produces oxygen and forms the ba
 Cutting Knowledge Date: December 2023
 Today Date: 12 Oct 2024
 
-You are Claude, an AI assistant created by Anthropic to be helpful, harmless, and honest.
+You are an AI assistant created to be helpful and honest. Always think step by step and layout your chain of thought in great detail.
 <|eot_id|>
 <|start_header_id|>user<|end_header_id|>
 
@@ -603,7 +618,7 @@ New life awakens
 Cutting Knowledge Date: December 2023
 Today Date: 12 Oct 2024
 
-You are Claude, an AI assistant created by Anthropic to be helpful, harmless, and honest.
+You are an AI assistant created to be helpful and honest. Always think step by step and layout your chain of thought in great detail.
 <|eot_id|>
 <|start_header_id|>user<|end_header_id|>
 
@@ -624,7 +639,7 @@ Each state has distinct properties based on the arrangement and movement of part
 Cutting Knowledge Date: December 2023
 Today Date: 12 Oct 2024
 
-You are Claude, an AI assistant created by Anthropic to be helpful, harmless, and honest.
+You are an AI assistant created to be helpful and honest. Always think step by step and layout your chain of thought in great detail.
 <|eot_id|>
 <|start_header_id|>user<|end_header_id|>
 
@@ -645,11 +660,6 @@ Rainbows appear as an arc because of the specific angle at which this light refr
     ]
     wrapper.collect_calibration_data(input_output_pairs)
 
-    # Analyze model state
-    #analysis_results = wrapper.analyze_model_state("The quick brown fox")
-    #print("Analysis Results:")
-    #print(analysis_results)
-
     # Generate and analyze text
     generation_results = wrapper.generate_and_analyze(
         """<|start_header_id|>system<|end_header_id|>
@@ -657,7 +667,7 @@ Rainbows appear as an arc because of the specific angle at which this light refr
 Cutting Knowledge Date: December 2023
 Today Date: 12 Oct 2024
 
-You are Claude, an AI assistant created by Anthropic to be helpful, harmless, and honest.
+You are an AI assistant created to be helpful and honest. Always think step by step and layout your chain of thought in great detail.
 <|eot_id|>
 <|start_header_id|>user<|end_header_id|>
 
@@ -668,21 +678,20 @@ How many r's are in the word strawberry?
         method='temperature',
         temperature=0.3
     )
-    #print("Generation Results:")
 
     # Visualize results
     wrapper.visualize_entropy_over_time(generation_results)
-    wrapper.visualize_hidden_state_norms(generation_results)
+    # wrapper.visualize_hidden_state_norms(generation_results)
     wrapper.visualize_model_states(generation_results)
 
     # For attention heatmap and head entropies, we need the attention values
     # Let's assume we have them from the last generation step
-    last_step_attentions = generation_results['step_analyses'][-1]['attentions']
-    last_step_tokens = wrapper.tokenizer.convert_ids_to_tokens(generation_results['generated_ids'][0])
-    wrapper.visualize_attention_heatmap(last_step_attentions, last_step_tokens)
-    wrapper.visualize_head_entropies(last_step_attentions)
+    #last_step_attentions = generation_results['step_analyses'][-1]['attentions']
+    #last_step_tokens = wrapper.tokenizer.convert_ids_to_tokens(generation_results['generated_ids'][0])
+    #wrapper.visualize_attention_heatmap(last_step_attentions, last_step_tokens)
+    #wrapper.visualize_head_entropies(last_step_attentions)
 
     # For layer activations, we need the hidden states
     # Let's assume we have them from the last generation step
-    last_step_hidden_states = generation_results['step_analyses'][-1]['hidden_states']
-    wrapper.visualize_layer_activations(last_step_hidden_states)
+    #last_step_hidden_states = generation_results['step_analyses'][-1]['hidden_states']
+    #wrapper.visualize_layer_activations(last_step_hidden_states)
